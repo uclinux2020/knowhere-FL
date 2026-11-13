@@ -58,6 +58,7 @@ constexpr const char* INDEX_GPU_CAGRA = "GPU_CAGRA";
 // names in FL builds (the CUDA path is excluded at build time); FL_* are
 // explicit aliases for debugging and A/B testing.
 constexpr const char* INDEX_FL_BRUTEFORCE = "FL_BRUTE_FORCE";
+constexpr const char* INDEX_FL_IVFFLAT = "FL_IVF_FLAT";
 
 constexpr const char* INDEX_HNSW = "HNSW";
 constexpr const char* INDEX_HNSW_SQ = "HNSW_SQ";

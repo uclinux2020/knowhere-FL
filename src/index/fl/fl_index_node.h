@@ -17,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <new>
 #include <queue>
 #include <string>
 #include <vector>

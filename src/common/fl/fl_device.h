@@ -61,6 +61,15 @@ struct FlDeviceOps {
     //   Returns 0 on success.
     int (*brute_force_topk)(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int64_t k, int metric,
                             float* out_dist, int64_t* out_ids, void* stream);
+
+    // ivf_flat_scan: per-query top-k over a candidate subset of xb.
+    //   xb/xq are DEVICE pointers; cand_ids (concatenated member ids) and
+    //   cand_offsets (nq+1 prefix offsets into cand_ids) are HOST pointers;
+    //   the adapter uploads the candidate lists itself. out_* are HOST.
+    //   Returns 0 on success. May be nullptr -> caller falls back to CPU scan.
+    int (*ivf_flat_scan)(const void* xb, int64_t nb, int64_t dim, const void* xq, int64_t nq, const int64_t* cand_ids,
+                         const int64_t* cand_offsets, int64_t k, int metric, float* out_dist, int64_t* out_ids,
+                         void* stream);
 };
 
 // Returns the currently registered ops table, or nullptr when no chip adapter

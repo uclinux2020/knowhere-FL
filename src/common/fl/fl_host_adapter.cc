@@ -1,0 +1,211 @@
+// Copyright (C) 2026 Knowhere-FL contributors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
+
+#include "common/fl/fl_host_adapter.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <new>
+#include <utility>
+#include <vector>
+
+#include "common/fl/fl_device.h"
+#include "knowhere/log.h"
+
+namespace knowhere {
+namespace fl {
+namespace {
+
+// ---------------------------------------------------------------------------
+// Host implementation of the FlDeviceOps contract.
+// metric encoding (see fl_device.h): 0 = L2 (smaller is better), 1 = IP
+// (larger is better).
+// ---------------------------------------------------------------------------
+
+int
+host_device_count() {
+    // Pretend there is exactly one "device" so the device path is exercised.
+    return 1;
+}
+
+int
+host_set_device(int /*device_id*/) {
+    return 0;
+}
+
+int
+host_device_sync() {
+    return 0;
+}
+
+void*
+host_malloc(size_t bytes) {
+    return std::malloc(bytes == 0 ? 1 : bytes);
+}
+
+void
+host_free(void* ptr) {
+    std::free(ptr);
+}
+
+int
+host_memcpy(void* dst, const void* src, size_t bytes, void* /*stream*/) {
+    std::memcpy(dst, src, bytes);
+    return 0;
+}
+
+void*
+host_stream_create() {
+    return nullptr;
+}
+
+void
+host_stream_destroy(void* /*stream*/) {}
+
+int
+host_stream_sync(void* /*stream*/) {
+    return 0;
+}
+
+inline float
+host_distance(const float* a, const float* b, int64_t dim, int metric) {
+    float dot = 0.f, na = 0.f, nb = 0.f;
+    for (int64_t d = 0; d < dim; ++d) {
+        dot += a[d] * b[d];
+        if (metric == 0) {
+            na += a[d] * a[d];
+            nb += b[d] * b[d];
+        }
+    }
+    return metric == 1 ? dot : (na + nb - 2.f * dot);
+}
+
+// topk over a candidate list defined by a lambda id accessor. Shared by
+// brute_force_topk (all ids) and ivf_flat_scan (subset).
+template <typename IdAt>
+void
+host_topk_over_candidates(const float* xb, int64_t dim, const float* xq, int64_t nq, const int64_t* cand_counts,
+                          int64_t k, int metric, IdAt&& id_at, float* out_dist, int64_t* out_ids) {
+#pragma omp parallel for schedule(dynamic)
+    for (int64_t i = 0; i < nq; ++i) {
+        const float* q = xq + i * dim;
+        const int64_t nc = cand_counts[i];
+        using Cand = std::pair<float, int64_t>;
+        const bool is_ip = (metric == 1);
+        auto cmp = [is_ip](const Cand& a, const Cand& b) { return is_ip ? (a.first > b.first) : (a.first < b.first); };
+        // simple selection: keep an unsorted buffer of k best
+        std::vector<Cand> best;
+        best.reserve(static_cast<size_t>(k) + 1);
+        float worst = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+        for (int64_t c = 0; c < nc; ++c) {
+            const int64_t id = id_at(i, c);
+            const float dist = host_distance(q, xb + id * dim, dim, metric);
+            if ((int64_t)best.size() < k) {
+                best.emplace_back(dist, id);
+                if (is_ip) {
+                    worst = std::min(worst, dist);
+                } else {
+                    worst = std::max(worst, dist);
+                }
+            } else if ((is_ip && dist > worst) || (!is_ip && dist < worst)) {
+                // replace current worst
+                auto it = std::min_element(best.begin(), best.end(),
+                                           [is_ip](const Cand& a, const Cand& b) {
+                                               return is_ip ? (a.first < b.first) : (a.first > b.first);
+                                           });
+                *it = {dist, id};
+                worst = is_ip ? std::min_element(best.begin(), best.end(),
+                                                 [](const Cand& a, const Cand& b) { return a.first < b.first; })
+                                    ->first
+                              : std::max_element(best.begin(), best.end(),
+                                                 [](const Cand& a, const Cand& b) { return a.first < b.first; })
+                                    ->first;
+            }
+        }
+        std::sort(best.begin(), best.end(), [is_ip](const Cand& a, const Cand& b) {
+            return is_ip ? (a.first > b.first) : (a.first < b.first);
+        });
+        for (int64_t t = 0; t < k; ++t) {
+            if (t < (int64_t)best.size()) {
+                out_dist[i * k + t] = best[t].first;
+                out_ids[i * k + t] = best[t].second;
+            } else {
+                out_dist[i * k + t] = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+                out_ids[i * k + t] = -1;
+            }
+        }
+    }
+}
+
+int
+host_brute_force_topk(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int64_t k, int metric,
+                      float* out_dist, int64_t* out_ids, void* /*stream*/) {
+    if (xb == nullptr || xq == nullptr || out_dist == nullptr || out_ids == nullptr) {
+        return -1;
+    }
+    std::vector<int64_t> counts(nq, nb);
+    host_topk_over_candidates(static_cast<const float*>(xb), dim, static_cast<const float*>(xq), nq, counts.data(), k,
+                              metric, [](int64_t, int64_t c) { return c; }, out_dist, out_ids);
+    return 0;
+}
+
+int
+host_ivf_flat_scan(const void* xb, int64_t /*nb*/, int64_t dim, const void* xq, int64_t nq, const int64_t* cand_ids,
+                   const int64_t* cand_offsets, int64_t k, int metric, float* out_dist, int64_t* out_ids,
+                   void* /*stream*/) {
+    if (xb == nullptr || xq == nullptr || cand_ids == nullptr || cand_offsets == nullptr || out_dist == nullptr ||
+        out_ids == nullptr) {
+        return -1;
+    }
+    std::vector<int64_t> counts(nq);
+    for (int64_t i = 0; i < nq; ++i) {
+        counts[i] = cand_offsets[i + 1] - cand_offsets[i];
+    }
+    host_topk_over_candidates(static_cast<const float*>(xb), dim, static_cast<const float*>(xq), nq, counts.data(), k,
+                              metric,
+                              [cand_ids, cand_offsets](int64_t i, int64_t c) { return cand_ids[cand_offsets[i] + c]; },
+                              out_dist, out_ids);
+    return 0;
+}
+
+const FlDeviceOps g_host_ops = {
+    host_device_count, host_set_device, host_device_sync,
+    host_malloc,       host_free,       host_memcpy,
+    host_memcpy,       host_memcpy,  // d2h, d2d
+    host_stream_create, host_stream_destroy, host_stream_sync,
+    host_brute_force_topk,
+    host_ivf_flat_scan,
+};
+
+}  // namespace
+
+bool
+RegisterHostAdapter() {
+    if (GetDeviceOps() != nullptr) {
+        LOG_KNOWHERE_WARNING_ << "FL adapter already registered; host adapter not installed";
+        return false;
+    }
+    RegisterDeviceOps(&g_host_ops);
+    LOG_KNOWHERE_INFO_ << "FL host adapter registered (device path emulated on CPU)";
+    return true;
+}
+
+void
+UnregisterHostAdapter() {
+    if (GetDeviceOps() == &g_host_ops) {
+        RegisterDeviceOps(nullptr);
+    }
+}
+
+}  // namespace fl
+}  // namespace knowhere

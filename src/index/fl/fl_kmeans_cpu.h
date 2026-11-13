@@ -47,20 +47,39 @@ LloydKmeansCpu(const float* x, int64_t nb, int64_t dim, int64_t nlist, int metri
         std::memcpy(centroids + l * dim, x + perm[l] * dim, dim * sizeof(float));
     }
 
+    // Assignment cost model: for L2, argmin_l ||v-c_l||^2 = argmin_l (||c_l||^2
+    // - 2*v.c_l) -- the query norm ||v||^2 is a constant offset across l and
+    // never changes the selection, so it is eliminated outright. Centroid
+    // norms are recomputed once per iteration (they change after each
+    // update). This mirrors exactly what the device kmeans_assign kernel
+    // computes via its mm+argmin composition.
+    std::vector<float> cent_norms(static_cast<size_t>(nlist), 0.f);
+    auto refresh_centroid_norms = [&] {
+        if (metric_code != 0) {
+            return;
+        }
+#pragma omp parallel for schedule(static)
+        for (int64_t l = 0; l < nlist; ++l) {
+            const float* c = centroids + l * dim;
+            float s = 0.f;
+            for (int64_t d = 0; d < dim; ++d) {
+                s += c[d] * c[d];
+            }
+            cent_norms[static_cast<size_t>(l)] = s;
+        }
+    };
+
     auto nearest = [&](const float* v) {
         int64_t best = 0;
         float best_score = metric_code == 1 ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
         for (int64_t l = 0; l < nlist; ++l) {
             const float* c = centroids + l * dim;
-            float dot = 0.f, na = 0.f, nc = 0.f;
+            float dot = 0.f;
             for (int64_t d = 0; d < dim; ++d) {
                 dot += v[d] * c[d];
-                if (metric_code == 0) {
-                    na += v[d] * v[d];
-                    nc += c[d] * c[d];
-                }
             }
-            const float score = metric_code == 1 ? dot : (na + nc - 2.f * dot);
+            const float score =
+                metric_code == 1 ? dot : (cent_norms[static_cast<size_t>(l)] - 2.f * dot);
             if ((metric_code == 1 && score > best_score) || (metric_code == 0 && score < best_score)) {
                 best_score = score;
                 best = l;
@@ -72,6 +91,7 @@ LloydKmeansCpu(const float* x, int64_t nb, int64_t dim, int64_t nlist, int metri
     std::vector<int64_t> owner(nb, -1);
     std::vector<int64_t> cur(nb, -1);
     for (int iter = 0; iter < max_iters; ++iter) {
+        refresh_centroid_norms();
 #pragma omp parallel for schedule(dynamic)
         for (int64_t j = 0; j < nb; ++j) {
             cur[j] = nearest(x + j * dim);

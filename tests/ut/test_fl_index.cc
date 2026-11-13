@@ -583,4 +583,58 @@ TEST_CASE("FL_CAGRA post-filters bitset from traversal results", "[fl]") {
     }
 }
 
+TEST_CASE("FL_CAGRA GetVectorByIds returns raw vectors", "[fl]") {
+    knowhere::fl::UnregisterHostAdapter();
+    auto base = GenDataSet(kNb, kDim, 42);
+    auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_CAGRA);
+    knowhere::Json build = knowhere::Json::parse(R"({"metric_type":"L2","dim":16,"graph_degree":16})");
+    REQUIRE(idx.Build(base, build) == knowhere::Status::success);
+
+    REQUIRE(idx.HasRawData("L2"));
+    std::vector<int64_t> want{0, 7, 123, 1999};
+    auto ids_ds = knowhere::GenIdsDataSet(want.size(), want.data());
+    auto res = idx.GetVectorByIds(ids_ds);
+    REQUIRE(res.has_value());
+    const float* got = static_cast<const float*>(res.value()->GetTensor());
+    const float* src = static_cast<const float*>(base->GetTensor());
+    for (size_t i = 0; i < want.size(); ++i) {
+        for (int64_t d = 0; d < kDim; ++d) {
+            REQUIRE(got[i * kDim + d] == src[want[i] * kDim + d]);
+        }
+    }
+}
+
+TEST_CASE("FL_BRUTE_FORCE bitset post-filter compacts results", "[fl]") {
+    knowhere::fl::RegisterHostAdapter();  // device path: kernel scans the full base, bitset applied on host
+    auto base = GenDataSet(kNb, kDim, 42);
+    auto query = GenDataSet(1, kDim, 7);
+
+    auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_BRUTEFORCE);
+    knowhere::Json build = knowhere::Json::parse(R"({"metric_type":"L2","dim":16})");
+    REQUIRE(idx.Build(base, build) == knowhere::Status::success);
+
+    knowhere::Json search = knowhere::Json::parse(R"({"metric_type":"L2","k":10})");
+    auto unfiltered = idx.Search(query, search, nullptr);
+    REQUIRE(unfiltered.has_value());
+    const int64_t banned = unfiltered.value()->GetIds()[0];
+
+    std::vector<uint8_t> bits(kNb, 0);
+    bits[static_cast<size_t>(banned)] = 1;
+    auto filtered = idx.Search(query, search, knowhere::BitsetView(bits.data(), kNb));
+    REQUIRE(filtered.has_value());
+    const auto* fids = filtered.value()->GetIds();
+    // banned id must not appear, and the remaining results must stay
+    // front-packed (no -1 holes before the tail)
+    bool seen_pad = false;
+    for (int64_t t = 0; t < kK; ++t) {
+        REQUIRE(fids[t] != banned);
+        if (fids[t] == -1) {
+            seen_pad = true;
+        } else {
+            REQUIRE_FALSE(seen_pad);  // no valid result after a padding hole
+        }
+    }
+    knowhere::fl::UnregisterHostAdapter();
+}
+
 #endif  // KNOWHERE_WITH_FL

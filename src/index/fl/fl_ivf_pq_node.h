@@ -103,6 +103,7 @@ class FlIvfPqIndexNode : public IndexNode {
         }
         LOG_KNOWHERE_INFO_ << "FL IVF_PQ trained: nlist=" << nlist_ << " m=" << m_ << " ksub=" << ksub_
                            << " dsub=" << dsub_;
+        RefreshCentroidNorms();
         return Status::success;
     }
 
@@ -121,14 +122,24 @@ class FlIvfPqIndexNode : public IndexNode {
         invlists_.assign(nlist_, {});
         codes_.resize(static_cast<size_t>(nb_) * m_);
         std::vector<int64_t> assign(nb_);
+        // Norm caches make the L2 nearest-selection a pure dot-product scan:
+        // argmin ||v-c||^2 == argmin ||c||^2 - 2*v.c (query norm is a constant
+        // offset). Coarse norms come from the Train-time cache; codebook
+        // norms are computed once per Add instead of nb*m times inside
+        // NearestIn.
+        std::vector<float> cb_norms;
+        if (metric_code_ == 0) {
+            cb_norms = ComputeNorms(codebooks_.data(), m_ * ksub_, dsub_);
+        }
+        const float* cent_norms = cent_norms_.data();  // empty for IP (unused)
 #pragma omp parallel for schedule(dynamic)
         for (int64_t j = 0; j < nb_; ++j) {
             const float* v = x + j * dim_;
-            assign[j] = NearestIn(v, centroids_.data(), nlist_, dim_);
+            assign[j] = NearestIn(v, centroids_.data(), cent_norms, nlist_, dim_);
             // per-subspace encoding
             for (int64_t s = 0; s < m_; ++s) {
-                codes_[static_cast<size_t>(j) * m_ + s] = static_cast<uint8_t>(
-                    NearestIn(v + s * dsub_, codebooks_.data() + s * ksub_ * dsub_, ksub_, dsub_));
+                codes_[static_cast<size_t>(j) * m_ + s] = static_cast<uint8_t>(NearestIn(
+                    v + s * dsub_, codebooks_.data() + s * ksub_ * dsub_, cb_norms.data() + s * ksub_, ksub_, dsub_));
             }
         }
         for (int64_t j = 0; j < nb_; ++j) {
@@ -189,9 +200,8 @@ class FlIvfPqIndexNode : public IndexNode {
         if (!done) {
             CpuAdcScan(xq, nq, k, cand_ids, cand_offsets, distances, ids);
         }
-        if (!bitset.empty()) {
-            ApplyBitsetPostFilter(distances, ids, nq, k, bitset);
-        }
+        // bitset already applied up-front in BuildCandidateLists (both device
+        // and CPU scans receive pre-filtered candidates); no post-filter here.
         return GenResultDataSet(nq, k, ids, distances);
     }
 
@@ -286,6 +296,7 @@ class FlIvfPqIndexNode : public IndexNode {
                 reader(invlists_[l].data(), sizeof(int64_t), sz);
             }
         }
+        RefreshCentroidNorms();
         TryStageToDevice();
         return Status::success;
     }
@@ -349,20 +360,49 @@ class FlIvfPqIndexNode : public IndexNode {
  private:
     // nearest entry in `table` (n rows of width `width`) for subvector v
     int64_t
-    NearestIn(const float* v, const float* table, int64_t n, int64_t width) const {
+    // Squared norms of `n` row vectors of width `width` (L2 only; callers
+    // skip this entirely for IP).
+    static std::vector<float>
+    ComputeNorms(const float* table, int64_t n, int64_t width) {
+        std::vector<float> norms(static_cast<size_t>(n), 0.f);
+        for (int64_t l = 0; l < n; ++l) {
+            const float* c = table + l * width;
+            float s = 0.f;
+            for (int64_t d = 0; d < width; ++d) {
+                s += c[d] * c[d];
+            }
+            norms[static_cast<size_t>(l)] = s;
+        }
+        return norms;
+    }
+
+    // Recompute the cached coarse-centroid norms; called after Train and
+    // Deserialize (centroids never change afterwards in v1).
+    void
+    RefreshCentroidNorms() {
+        if (metric_code_ != 0) {  // IP needs no norms
+            cent_norms_.clear();
+            return;
+        }
+        cent_norms_ = ComputeNorms(centroids_.data(), nlist_, dim_);
+    }
+
+    // Nearest row in `table` under the node metric. For L2 the score is
+    // ||c||^2 - 2*v.c using the precomputed `table_norms` (the query norm is
+    // a constant offset and is eliminated); `table_norms` may be nullptr only
+    // when the metric is IP.
+    int64_t
+    NearestIn(const float* v, const float* table, const float* table_norms, int64_t n, int64_t width) const {
         int64_t best = 0;
         float best_score = metric_code_ == 1 ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
         for (int64_t l = 0; l < n; ++l) {
             const float* c = table + l * width;
-            float dot = 0.f, na = 0.f, nc = 0.f;
+            float dot = 0.f;
             for (int64_t d = 0; d < width; ++d) {
                 dot += v[d] * c[d];
-                if (metric_code_ == 0) {
-                    na += v[d] * v[d];
-                    nc += c[d] * c[d];
-                }
             }
-            const float score = metric_code_ == 1 ? dot : (na + nc - 2.f * dot);
+            const float score =
+                metric_code_ == 1 ? dot : (table_norms[static_cast<size_t>(l)] - 2.f * dot);
             if ((metric_code_ == 1 && score > best_score) || (metric_code_ == 0 && score < best_score)) {
                 best_score = score;
                 best = l;
@@ -379,17 +419,15 @@ class FlIvfPqIndexNode : public IndexNode {
         for (int64_t i = 0; i < nq; ++i) {
             std::vector<std::pair<float, int64_t>> scores(nlist_);
             const float* q = xq + i * dim_;
+            // Route score: IP uses the raw dot; L2 uses ||c||^2 - 2*q.c from
+            // the cached centroid norms (query norm is a constant offset).
             for (int64_t l = 0; l < nlist_; ++l) {
                 const float* c = centroids_.data() + l * dim_;
-                float dot = 0.f, na = 0.f, nc = 0.f;
+                float dot = 0.f;
                 for (int64_t d = 0; d < dim_; ++d) {
                     dot += q[d] * c[d];
-                    if (metric_code_ == 0) {
-                        na += q[d] * q[d];
-                        nc += c[d] * c[d];
-                    }
                 }
-                scores[l] = {metric_code_ == 1 ? dot : (na + nc - 2.f * dot), l};
+                scores[l] = {metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot), l};
             }
             const bool is_ip = metric_code_ == 1;
             std::partial_sort(scores.begin(), scores.begin() + nprobe, scores.end(),
@@ -432,13 +470,19 @@ class FlIvfPqIndexNode : public IndexNode {
             for (int64_t s = 0; s < m_; ++s) {
                 const float* q_sub = q + s * dsub_;
                 const float* cb_s = codebooks_.data() + s * ksub_ * dsub_;
+                // query sub-vector norm is loop-invariant per subspace
+                float na = 0.f;
+                if (!is_ip) {
+                    for (int64_t d = 0; d < dsub_; ++d) {
+                        na += q_sub[d] * q_sub[d];
+                    }
+                }
                 for (int64_t ks = 0; ks < ksub_; ++ks) {
                     const float* c = cb_s + ks * dsub_;
-                    float dot = 0.f, na = 0.f, nc = 0.f;
+                    float dot = 0.f, nc = 0.f;
                     for (int64_t d = 0; d < dsub_; ++d) {
                         dot += q_sub[d] * c[d];
                         if (!is_ip) {
-                            na += q_sub[d] * q_sub[d];
                             nc += c[d] * c[d];
                         }
                     }
@@ -516,19 +560,6 @@ class FlIvfPqIndexNode : public IndexNode {
         LOG_KNOWHERE_INFO_ << "FL IVF_PQ staged codebooks+codes on device (" << (cb_bytes + code_bytes) << " bytes)";
     }
 
-    static void
-    ApplyBitsetPostFilter(float* distances, int64_t* ids, int64_t nq, int64_t k, const BitsetView& bitset) {
-        for (int64_t i = 0; i < nq; ++i) {
-            for (int64_t t = 0; t < k; ++t) {
-                const int64_t id = ids[i * k + t];
-                if (id >= 0 && bitset.test(id)) {
-                    ids[i * k + t] = -1;
-                    distances[i * k + t] = std::numeric_limits<float>::max();
-                }
-            }
-        }
-    }
-
     int64_t dim_{0};
     int64_t nb_{0};
     int64_t nlist_{0};
@@ -537,6 +568,7 @@ class FlIvfPqIndexNode : public IndexNode {
     int64_t dsub_{0};        // dim / m
     int metric_code_{0};     // 0 = L2, 1 = IP
     std::vector<float> centroids_;    // nlist * dim (coarse)
+    std::vector<float> cent_norms_;   // cached ||c_l||^2 of coarse centroids (L2 only)
     std::vector<float> codebooks_;    // m * ksub * dsub
     std::vector<uint8_t> codes_;      // nb * m
     std::vector<std::vector<int64_t>> invlists_;

@@ -189,11 +189,20 @@ class FlCagraIndexNode : public IndexNode {
         if (status != Status::success) {
             return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
         }
-        std::vector<float> out(in_ids.size() * static_cast<size_t>(dim_));
-        for (size_t i = 0; i < in_ids.size(); ++i) {
-            std::memcpy(out.data() + i * dim_, host_xb_.data() + in_ids[i] * dim_, dim_ * sizeof(float));
+        const int64_t rows = static_cast<int64_t>(in_ids.size());
+        if (rows == 0) {
+            return GenResultDataSet(0, dim_, nullptr);
         }
-        return GenDataSet(static_cast<int64_t>(in_ids.size()), dim_, out.data());
+        // GenResultDataSet takes ownership of the heap buffer (IsOwner=true),
+        // same idiom as the other FL nodes.
+        auto* data = new (std::nothrow) float[static_cast<size_t>(rows) * dim_];
+        if (data == nullptr) {
+            return expected<DataSetPtr>::Err(Status::malloc_error, "GetVectorByIds alloc failed");
+        }
+        for (int64_t i = 0; i < rows; ++i) {
+            std::memcpy(data + i * dim_, host_xb_.data() + in_ids[i] * dim_, dim_ * sizeof(float));
+        }
+        return GenResultDataSet(rows, dim_, data);
     }
 
     bool
@@ -326,6 +335,22 @@ class FlCagraIndexNode : public IndexNode {
         graph_ids_.resize(static_cast<size_t>(nb_) * m, -1);
 
         const bool is_ip = (metric_code_ == 1);
+        // Precompute all vector norms once (O(nb*dim)); the quadratic loop
+        // then only pays for the dot product per pair. Same GEMM-style
+        // decomposition the device builder will use.
+        std::vector<float> norms;
+        if (!is_ip) {
+            norms.resize(static_cast<size_t>(nb_), 0.f);
+#pragma omp parallel for schedule(static)
+            for (int64_t v = 0; v < nb_; ++v) {
+                const float* vv = host_xb_.data() + v * dim_;
+                float s = 0.f;
+                for (int64_t d = 0; d < dim_; ++d) {
+                    s += vv[d] * vv[d];
+                }
+                norms[static_cast<size_t>(v)] = s;
+            }
+        }
 #pragma omp parallel for schedule(dynamic)
         for (int64_t v = 0; v < nb_; ++v) {
             const float* vv = host_xb_.data() + v * dim_;
@@ -335,7 +360,14 @@ class FlCagraIndexNode : public IndexNode {
                 if (u == v) {
                     continue;
                 }
-                all.emplace_back(fl::FlGraphDistance(vv, host_xb_.data() + u * dim_, dim_, metric_code_), u);
+                const float* uu = host_xb_.data() + u * dim_;
+                float dot = 0.f;
+                for (int64_t d = 0; d < dim_; ++d) {
+                    dot += vv[d] * uu[d];
+                }
+                const float dist = is_ip ? dot
+                                         : (norms[static_cast<size_t>(v)] + norms[static_cast<size_t>(u)] - 2.f * dot);
+                all.emplace_back(dist, u);
             }
             auto better = [is_ip](const std::pair<float, int64_t>& a, const std::pair<float, int64_t>& b) {
                 return is_ip ? (a.first > b.first) : (a.first < b.first);

@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <queue>
 #include <utility>
 #include <vector>
 
@@ -78,19 +79,6 @@ host_stream_sync(void* /*stream*/) {
     return 0;
 }
 
-inline float
-host_distance(const float* a, const float* b, int64_t dim, int metric) {
-    float dot = 0.f, na = 0.f, nb = 0.f;
-    for (int64_t d = 0; d < dim; ++d) {
-        dot += a[d] * b[d];
-        if (metric == 0) {
-            na += a[d] * a[d];
-            nb += b[d] * b[d];
-        }
-    }
-    return metric == 1 ? dot : (na + nb - 2.f * dot);
-}
-
 // topk over a candidate list defined by a lambda id accessor. Shared by
 // brute_force_topk (all ids) and ivf_flat_scan (subset).
 template <typename IdAt>
@@ -101,47 +89,50 @@ host_topk_over_candidates(const float* xb, int64_t dim, const float* xq, int64_t
     for (int64_t i = 0; i < nq; ++i) {
         const float* q = xq + i * dim;
         const int64_t nc = cand_counts[i];
-        using Cand = std::pair<float, int64_t>;
         const bool is_ip = (metric == 1);
-        // simple selection: keep an unsorted buffer of k best
-        std::vector<Cand> best;
-        best.reserve(static_cast<size_t>(k) + 1);
-        float worst = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
-        for (int64_t c = 0; c < nc; ++c) {
-            const int64_t id = id_at(i, c);
-            const float dist = host_distance(q, xb + id * dim, dim, metric);
-            if ((int64_t)best.size() < k) {
-                best.emplace_back(dist, id);
-                if (is_ip) {
-                    worst = std::min(worst, dist);
-                } else {
-                    worst = std::max(worst, dist);
-                }
-            } else if ((is_ip && dist > worst) || (!is_ip && dist < worst)) {
-                // replace current worst
-                auto it = std::min_element(best.begin(), best.end(),
-                                           [is_ip](const Cand& a, const Cand& b) {
-                                               return is_ip ? (a.first < b.first) : (a.first > b.first);
-                                           });
-                *it = {dist, id};
-                worst = is_ip ? std::min_element(best.begin(), best.end(),
-                                                 [](const Cand& a, const Cand& b) { return a.first < b.first; })
-                                    ->first
-                              : std::max_element(best.begin(), best.end(),
-                                                 [](const Cand& a, const Cand& b) { return a.first < b.first; })
-                                    ->first;
+        // max-heap of (dist, id); for L2 keep smallest, for IP keep largest.
+        // (same selection pattern as the nodes' CPU fallback paths)
+        using Cand = std::pair<float, int64_t>;
+        auto cmp = [is_ip](const Cand& a, const Cand& b) {
+            return is_ip ? (a.first > b.first) : (a.first < b.first);
+        };
+        std::priority_queue<Cand, std::vector<Cand>, decltype(cmp)> heap(cmp);
+        // query norm is loop-invariant; compute once per query
+        float na = 0.f;
+        if (!is_ip) {
+            for (int64_t d = 0; d < dim; ++d) {
+                na += q[d] * q[d];
             }
         }
-        std::sort(best.begin(), best.end(), [is_ip](const Cand& a, const Cand& b) {
-            return is_ip ? (a.first > b.first) : (a.first < b.first);
-        });
-        for (int64_t t = 0; t < k; ++t) {
-            if (t < (int64_t)best.size()) {
-                out_dist[i * k + t] = best[t].first;
-                out_ids[i * k + t] = best[t].second;
+        for (int64_t c = 0; c < nc; ++c) {
+            const int64_t id = id_at(i, c);
+            const float* b = xb + id * dim;
+            float dot = 0.f, nbsum = 0.f;
+            for (int64_t d = 0; d < dim; ++d) {
+                dot += q[d] * b[d];
+                if (!is_ip) {
+                    nbsum += b[d] * b[d];
+                }
+            }
+            const float dist = is_ip ? dot : (na + nbsum - 2.f * dot);
+            if (static_cast<int64_t>(heap.size()) < k) {
+                heap.emplace(dist, id);
             } else {
+                const float worst = heap.top().first;
+                if ((is_ip && dist > worst) || (!is_ip && dist < worst)) {
+                    heap.pop();
+                    heap.emplace(dist, id);
+                }
+            }
+        }
+        for (int64_t t = k - 1; t >= 0; --t) {
+            if (heap.empty()) {
                 out_dist[i * k + t] = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
                 out_ids[i * k + t] = -1;
+            } else {
+                out_dist[i * k + t] = heap.top().first;
+                out_ids[i * k + t] = heap.top().second;
+                heap.pop();
             }
         }
     }
@@ -188,15 +179,32 @@ host_kmeans_assign(const void* xb, int64_t nb, int64_t dim, const void* centroid
     const float* cent = static_cast<const float*>(centroids);
     // Reference semantics for the device kernel: per-vector argmin over
     // centroids (argmax for IP). Pure mm + argmin composition, no atomics.
+    // For L2 the query norm ||v||^2 is a constant offset across centroids and
+    // is eliminated (argmin ||v-c||^2 == argmin ||c||^2 - 2*v.c) -- exactly the
+    // GEMM decomposition the device kernel performs.
+    std::vector<float> cent_norms(static_cast<size_t>(nlist), 0.f);
+    if (metric == 0) {
+        for (int64_t c = 0; c < nlist; ++c) {
+            const float* cc = cent + c * dim;
+            for (int64_t d = 0; d < dim; ++d) {
+                cent_norms[static_cast<size_t>(c)] += cc[d] * cc[d];
+            }
+        }
+    }
 #pragma omp parallel for schedule(static)
     for (int64_t j = 0; j < nb; ++j) {
         const float* v = base + j * dim;
         float best = metric == 1 ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
         int64_t best_id = 0;
         for (int64_t c = 0; c < nlist; ++c) {
-            const float d = host_distance(v, cent + c * dim, dim, metric);
-            if ((metric == 1 && d > best) || (metric == 0 && d < best)) {
-                best = d;
+            const float* cc = cent + c * dim;
+            float dot = 0.f;
+            for (int64_t d = 0; d < dim; ++d) {
+                dot += v[d] * cc[d];
+            }
+            const float dist = metric == 1 ? dot : (cent_norms[static_cast<size_t>(c)] - 2.f * dot);
+            if ((metric == 1 && dist > best) || (metric == 0 && dist < best)) {
+                best = dist;
                 best_id = c;
             }
         }
@@ -231,8 +239,23 @@ host_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, c
         for (int64_t s = 0; s < m; ++s) {
             const float* q_sub = q + s * dsub;
             const float* cb_s = cb + s * ksub * dsub;
+            // query sub-vector norm is loop-invariant per subspace
+            float na = 0.f;
+            if (metric == 0) {
+                for (int64_t d = 0; d < dsub; ++d) {
+                    na += q_sub[d] * q_sub[d];
+                }
+            }
             for (int64_t ks = 0; ks < ksub; ++ks) {
-                lut[static_cast<size_t>(s) * ksub + ks] = host_distance(q_sub, cb_s + ks * dsub, dsub, metric);
+                const float* c = cb_s + ks * dsub;
+                float dot = 0.f, nc = 0.f;
+                for (int64_t d = 0; d < dsub; ++d) {
+                    dot += q_sub[d] * c[d];
+                    if (metric == 0) {
+                        nc += c[d] * c[d];
+                    }
+                }
+                lut[static_cast<size_t>(s) * ksub + ks] = metric == 1 ? dot : (na + nc - 2.f * dot);
             }
         }
         // 2) ADC scan over candidates

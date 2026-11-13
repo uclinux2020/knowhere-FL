@@ -323,7 +323,7 @@ class FlBruteForceIndexNode : public IndexNode {
             return expected<DataSetPtr>::Err(Status::fl_device_error, "FL brute_force_topk kernel failed");
         }
         if (!bitset.empty()) {
-            ApplyBitsetPostFilter(distances, ids, nq, k, bitset);
+            ApplyBitsetPostFilter(distances, ids, nq, k, bitset, metric_code_);
         }
         return GenResultDataSet(nq, k, ids, distances);
     }
@@ -348,16 +348,24 @@ class FlBruteForceIndexNode : public IndexNode {
             };
             std::priority_queue<Cand, std::vector<Cand>, decltype(cmp)> heap(cmp);
             const float* q = xq + i * dim_;
+            // query norm is loop-invariant; compute once per query
+            float na = 0.f;
+            if (!is_ip) {
+                for (int64_t d = 0; d < dim_; ++d) {
+                    na += q[d] * q[d];
+                }
+            }
             for (int64_t j = 0; j < nb_; ++j) {
                 if (!bitset.empty() && bitset.test(j)) {
                     continue;
                 }
                 const float* b = host_xb_.data() + j * dim_;
-                float dot = 0.f, na = 0.f, nbsum = 0.f;
+                float dot = 0.f, nbsum = 0.f;
                 for (int64_t d = 0; d < dim_; ++d) {
                     dot += q[d] * b[d];
-                    na += q[d] * q[d];
-                    nbsum += b[d] * b[d];
+                    if (!is_ip) {
+                        nbsum += b[d] * b[d];
+                    }
                 }
                 float dist = is_ip ? dot : (na + nbsum - 2.f * dot);
                 if ((int64_t)heap.size() < k) {
@@ -384,15 +392,29 @@ class FlBruteForceIndexNode : public IndexNode {
         return GenResultDataSet(nq, k, ids, distances);
     }
 
+    // Post-filter for the device path (the device kernel scans the whole
+    // base set, so bitset must be applied on the host afterwards). Results
+    // are compacted towards the front (same behavior as FL_CAGRA) so the
+    // first `valid` entries are always usable; empty slots are padded with
+    // -1 and the metric-appropriate worst distance.
     static void
-    ApplyBitsetPostFilter(float* distances, int64_t* ids, int64_t nq, int64_t k, const BitsetView& bitset) {
+    ApplyBitsetPostFilter(float* distances, int64_t* ids, int64_t nq, int64_t k, const BitsetView& bitset,
+                          int metric_code) {
+        const float kWorst =
+            (metric_code == 1) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
         for (int64_t i = 0; i < nq; ++i) {
+            int64_t w = 0;
             for (int64_t t = 0; t < k; ++t) {
                 const int64_t id = ids[i * k + t];
-                if (id >= 0 && bitset.test(id)) {
-                    ids[i * k + t] = -1;
-                    distances[i * k + t] = std::numeric_limits<float>::max();
+                if (id >= 0 && !bitset.test(id)) {
+                    ids[i * k + w] = id;
+                    distances[i * k + w] = distances[i * k + t];
+                    ++w;
                 }
+            }
+            for (int64_t t = w; t < k; ++t) {
+                ids[i * k + t] = -1;
+                distances[i * k + t] = kWorst;
             }
         }
     }

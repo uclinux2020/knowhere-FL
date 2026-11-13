@@ -163,9 +163,8 @@ class FlIvfFlatIndexNode : public IndexNode {
         if (!done) {
             CpuScanCandidates(xq, nq, k, cand_ids, cand_offsets, distances, ids);
         }
-        if (!bitset.empty()) {
-            ApplyBitsetPostFilter(distances, ids, nq, k, bitset);
-        }
+        // bitset already applied up-front in BuildCandidateLists (both device
+        // and CPU scans receive pre-filtered candidates); no post-filter here.
         return GenResultDataSet(nq, k, ids, distances);
     }
 
@@ -271,6 +270,7 @@ class FlIvfFlatIndexNode : public IndexNode {
                 }
             }
         }
+        RefreshCentroidNorms();
         TryStageToDevice();
         return Status::success;
     }
@@ -396,6 +396,7 @@ class FlIvfFlatIndexNode : public IndexNode {
                 }
             }
             if (!assigned_on_device) {
+                RefreshCentroidNorms();
 #pragma omp parallel for schedule(dynamic)
                 for (int64_t j = 0; j < nb; ++j) {
                     cur[j] = NearestCentroid(x + j * dim_);
@@ -439,6 +440,7 @@ class FlIvfFlatIndexNode : public IndexNode {
             ops->free(d_c);
             fl::FlMemoryPool::Instance().TrackFree(staged_bytes);
         }
+        RefreshCentroidNorms();  // final centroids -> search-time norm cache
         LOG_KNOWHERE_INFO_ << "FL IVF_FLAT kmeans trained: nlist=" << nlist_ << " dim=" << dim_
                            << (staged_bytes != 0 ? " (device assignment)" : " (CPU assignment)");
     }
@@ -487,19 +489,20 @@ class FlIvfFlatIndexNode : public IndexNode {
 
     int64_t
     NearestCentroid(const float* v) const {
+        // L2 routing uses ||c||^2 - 2*v.c: the query norm is a constant
+        // offset across centroids and never changes the argmin. Centroid
+        // norms come from the cent_norms_ cache (refreshed whenever the
+        // centroids change) instead of being recomputed per call.
         int64_t best = 0;
         float best_score = metric_code_ == 1 ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
         for (int64_t l = 0; l < nlist_; ++l) {
             const float* c = centroids_.data() + l * dim_;
-            float dot = 0.f, na = 0.f, nc = 0.f;
+            float dot = 0.f;
             for (int64_t d = 0; d < dim_; ++d) {
                 dot += v[d] * c[d];
-                if (metric_code_ == 0) {
-                    na += v[d] * v[d];
-                    nc += c[d] * c[d];
-                }
             }
-            const float score = metric_code_ == 1 ? dot : (na + nc - 2.f * dot);
+            const float score =
+                metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot);
             if ((metric_code_ == 1 && score > best_score) || (metric_code_ == 0 && score < best_score)) {
                 best_score = score;
                 best = l;
@@ -508,27 +511,43 @@ class FlIvfFlatIndexNode : public IndexNode {
         return best;
     }
 
+    // Recompute the cached centroid norms; must be called after any centroid
+    // mutation (each kmeans iteration, Deserialize).
+    void
+    RefreshCentroidNorms() {
+        if (metric_code_ != 0) {  // IP routing needs no norms
+            cent_norms_.clear();
+            return;
+        }
+        cent_norms_.resize(static_cast<size_t>(nlist_), 0.f);
+        for (int64_t l = 0; l < nlist_; ++l) {
+            const float* c = centroids_.data() + l * dim_;
+            float s = 0.f;
+            for (int64_t d = 0; d < dim_; ++d) {
+                s += c[d] * c[d];
+            }
+            cent_norms_[static_cast<size_t>(l)] = s;
+        }
+    }
+
     void
     BuildCandidateLists(const float* xq, int64_t nq, int64_t nprobe, const BitsetView& bitset,
                         std::vector<int64_t>& cand_ids, std::vector<int64_t>& cand_offsets) const {
-        // approximate candidate count to reserve once
-        size_t approx = 0;
         std::vector<std::vector<int64_t>> probes(nq);
 #pragma omp parallel for schedule(dynamic)
         for (int64_t i = 0; i < nq; ++i) {
             std::vector<std::pair<float, int64_t>> scores(nlist_);
             const float* q = xq + i * dim_;
+            // Route score: IP uses the raw dot; L2 uses ||c||^2 - 2*q.c from
+            // the cached centroid norms (the query norm is a constant offset
+            // across centroids and does not affect probe selection).
             for (int64_t l = 0; l < nlist_; ++l) {
                 const float* c = centroids_.data() + l * dim_;
-                float dot = 0.f, na = 0.f, nc = 0.f;
+                float dot = 0.f;
                 for (int64_t d = 0; d < dim_; ++d) {
                     dot += q[d] * c[d];
-                    if (metric_code_ == 0) {
-                        na += q[d] * q[d];
-                        nc += c[d] * c[d];
-                    }
                 }
-                scores[l] = {metric_code_ == 1 ? dot : (na + nc - 2.f * dot), l};
+                scores[l] = {metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot), l};
             }
             const bool is_ip = metric_code_ == 1;
             std::partial_sort(scores.begin(), scores.begin() + nprobe, scores.end(),
@@ -568,14 +587,20 @@ class FlIvfFlatIndexNode : public IndexNode {
             std::vector<Cand> best;
             best.reserve(static_cast<size_t>(k) + 1);
             const float* q = xq + i * dim_;
+            // query norm is loop-invariant; compute once per query
+            float na = 0.f;
+            if (!is_ip) {
+                for (int64_t d = 0; d < dim_; ++d) {
+                    na += q[d] * q[d];
+                }
+            }
             for (int64_t c = cand_offsets[i]; c < cand_offsets[i + 1]; ++c) {
                 const int64_t id = cand_ids[c];
                 const float* b = host_xb_.data() + id * dim_;
-                float dot = 0.f, na = 0.f, nbsum = 0.f;
+                float dot = 0.f, nbsum = 0.f;
                 for (int64_t d = 0; d < dim_; ++d) {
                     dot += q[d] * b[d];
                     if (!is_ip) {
-                        na += q[d] * q[d];
                         nbsum += b[d] * b[d];
                     }
                 }
@@ -632,25 +657,13 @@ class FlIvfFlatIndexNode : public IndexNode {
         LOG_KNOWHERE_INFO_ << "FL IVF_FLAT staged " << nb_ << " x " << dim_ << " vectors on device";
     }
 
-    static void
-    ApplyBitsetPostFilter(float* distances, int64_t* ids, int64_t nq, int64_t k, const BitsetView& bitset) {
-        for (int64_t i = 0; i < nq; ++i) {
-            for (int64_t t = 0; t < k; ++t) {
-                const int64_t id = ids[i * k + t];
-                if (id >= 0 && bitset.test(id)) {
-                    ids[i * k + t] = -1;
-                    distances[i * k + t] = std::numeric_limits<float>::max();
-                }
-            }
-        }
-    }
-
     int64_t dim_{0};
     int64_t nb_{0};
     int64_t nlist_{0};
     int metric_code_{0};             // 0 = L2, 1 = IP
     bool use_device_assign_{true};   // device centroid routing (train/add)
     std::vector<float> centroids_;           // nlist * dim
+    std::vector<float> cent_norms_;          // cached ||c_l||^2 (L2 routing; empty for IP)
     std::vector<float> host_xb_;             // nb * dim
     std::vector<int64_t> assign_;            // nb -> list id
     std::vector<std::vector<int64_t>> invlists_;

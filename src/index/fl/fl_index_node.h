@@ -23,7 +23,9 @@
 #include <vector>
 
 #include "common/fl/fl_device.h"
+#include "common/fl/fl_device_router.h"
 #include "index/fl/fl_brute_force_config.h"
+#include "index/fl/fl_format.h"
 #include "io/memory_io.h"
 #include "knowhere/binaryset.h"
 #include "knowhere/bitsetview.h"
@@ -123,6 +125,35 @@ class FlBruteForceIndexNode : public IndexNode {
     }
 
     expected<DataSetPtr>
+    GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* /*op_context*/ = nullptr) const override {
+        if (dataset == nullptr) {
+            return expected<DataSetPtr>::Err(Status::invalid_args, "GetVectorByIds dataset is null");
+        }
+        std::vector<int64_t> in_ids;
+        const Status status = this->CompactOutToIn(dataset->GetIds(), dataset->GetRows(), in_ids);
+        if (status != Status::success) {
+            return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
+        }
+        const int64_t rows = static_cast<int64_t>(in_ids.size());
+        if (rows == 0) {
+            return GenResultDataSet(0, dim_, nullptr);
+        }
+        auto* data = new (std::nothrow) float[static_cast<size_t>(rows) * dim_];
+        if (data == nullptr) {
+            return expected<DataSetPtr>::Err(Status::malloc_error, "GetVectorByIds alloc failed");
+        }
+        for (int64_t i = 0; i < rows; ++i) {
+            std::memcpy(data + i * dim_, host_xb_.data() + in_ids[i] * dim_, dim_ * sizeof(float));
+        }
+        return GenResultDataSet(rows, dim_, data);
+    }
+
+    bool
+    HasRawData(const std::string& /*metric_type*/) const override {
+        return true;  // FL brute force always retains raw fp32 vectors (host_xb_)
+    }
+
+    expected<DataSetPtr>
     GetIndexMeta(std::unique_ptr<Config> /*cfg*/) const override {
         return expected<DataSetPtr>::Err(Status::not_implemented, "GetIndexMeta not implemented");
     }
@@ -135,6 +166,7 @@ class FlBruteForceIndexNode : public IndexNode {
         }
         try {
             MemoryIOWriter writer;
+            fl::WriteFormatHeader(writer);
             writer(&dim_, sizeof(dim_), 1);
             writer(&nb_, sizeof(nb_), 1);
             writer(&metric_code_, sizeof(metric_code_), 1);
@@ -156,6 +188,9 @@ class FlBruteForceIndexNode : public IndexNode {
             return Status::invalid_binary_set;
         }
         MemoryIOReader reader(binary->data.get(), binary->size);
+        if (!fl::ReadFormatHeader(reader, "BRUTE_FORCE")) {
+            return Status::invalid_binary_set;
+        }
         reader(&dim_, sizeof(dim_), 1);
         reader(&nb_, sizeof(nb_), 1);
         reader(&metric_code_, sizeof(metric_code_), 1);
@@ -173,6 +208,11 @@ class FlBruteForceIndexNode : public IndexNode {
     static std::unique_ptr<BaseConfig>
     StaticCreateConfig() {
         return std::make_unique<FlBruteForceConfig>();
+    }
+
+    static bool
+    StaticHasRawData(const knowhere::BaseConfig& /*config*/, const IndexVersion& /*version*/) {
+        return true;  // FL brute force always retains raw fp32 vectors
     }
 
     std::unique_ptr<BaseConfig>
@@ -217,7 +257,9 @@ class FlBruteForceIndexNode : public IndexNode {
         if (ops->set_device == nullptr || ops->malloc == nullptr || ops->memcpy_h2d == nullptr) {
             return;
         }
-        if (ops->set_device(0) != 0) {
+        // multi-device: this index is bound to one card for its lifetime
+        device_id_ = fl::FlDeviceRouter::Instance().Acquire();
+        if (ops->set_device(device_id_) != 0) {
             return;
         }
         void* d = ops->malloc(bytes);
@@ -239,6 +281,9 @@ class FlBruteForceIndexNode : public IndexNode {
         const fl::FlDeviceOps* ops = fl::GetDeviceOps();
         if (ops->brute_force_topk == nullptr || ops->memcpy_h2d == nullptr) {
             return expected<DataSetPtr>::Err(Status::not_implemented, "FL adapter lacks brute_force_topk");
+        }
+        if (ops->set_device != nullptr && ops->set_device(device_id_) != 0) {
+            return expected<DataSetPtr>::Err(Status::fl_device_error, "FL set_device failed");
         }
         const size_t q_bytes = static_cast<size_t>(nq) * dim_ * sizeof(float);
         void* d_q = ops->malloc(q_bytes);
@@ -344,6 +389,7 @@ class FlBruteForceIndexNode : public IndexNode {
     std::vector<float> host_xb_;
     fl::FlDeviceBuffer dev_xb_;
     bool dev_ready_{false};
+    int device_id_{0};  // bound at staging time via FlDeviceRouter (multi-device)
 };
 
 }  // namespace knowhere

@@ -24,6 +24,8 @@
 #include <vector>
 
 #include "common/fl/fl_device.h"
+#include "common/fl/fl_device_router.h"
+#include "index/fl/fl_format.h"
 #include "index/fl/fl_ivf_pq_config.h"
 #include "index/fl/fl_kmeans_cpu.h"
 #include "io/memory_io.h"
@@ -165,7 +167,9 @@ class FlIvfPqIndexNode : public IndexNode {
         bool done = false;
         if (dev_ready_) {
             const fl::FlDeviceOps* ops = fl::GetDeviceOps();
-            if (ops->ivf_pq_scan != nullptr) {
+            if (ops->set_device != nullptr && ops->set_device(device_id_) != 0) {
+                LOG_KNOWHERE_WARNING_ << "FL set_device failed in IVF_PQ search";
+            } else if (ops->ivf_pq_scan != nullptr) {
                 const size_t q_bytes = static_cast<size_t>(nq) * dim_ * sizeof(float);
                 void* d_q = ops->malloc(q_bytes);
                 if (d_q != nullptr && ops->memcpy_h2d(d_q, xq, q_bytes, nullptr) == 0) {
@@ -198,6 +202,19 @@ class FlIvfPqIndexNode : public IndexNode {
     }
 
     expected<DataSetPtr>
+    GetVectorByIds(const DataSetPtr, milvus::OpContext* = nullptr) const override {
+        return expected<DataSetPtr>::Err(
+            Status::not_implemented,
+            "FL IVF_PQ stores quantized codes only (no raw vectors); use GPU_IVF_FLAT/GPU_BRUTE_FORCE or a "
+            "refine-capable index when raw retrieval is required");
+    }
+
+    bool
+    HasRawData(const std::string& /*metric_type*/) const override {
+        return false;  // PQ keeps codes only
+    }
+
+    expected<DataSetPtr>
     GetIndexMeta(std::unique_ptr<Config>) const override {
         return expected<DataSetPtr>::Err(Status::not_implemented, "GetIndexMeta not implemented");
     }
@@ -209,6 +226,7 @@ class FlIvfPqIndexNode : public IndexNode {
         }
         try {
             MemoryIOWriter writer;
+            fl::WriteFormatHeader(writer);
             writer(&dim_, sizeof(dim_), 1);
             writer(&nb_, sizeof(nb_), 1);
             writer(&nlist_, sizeof(nlist_), 1);
@@ -242,6 +260,9 @@ class FlIvfPqIndexNode : public IndexNode {
             return Status::invalid_binary_set;
         }
         MemoryIOReader reader(binary->data.get(), binary->size);
+        if (!fl::ReadFormatHeader(reader, "IVF_PQ")) {
+            return Status::invalid_binary_set;
+        }
         reader(&dim_, sizeof(dim_), 1);
         reader(&nb_, sizeof(nb_), 1);
         reader(&nlist_, sizeof(nlist_), 1);
@@ -276,6 +297,11 @@ class FlIvfPqIndexNode : public IndexNode {
     static std::unique_ptr<BaseConfig>
     StaticCreateConfig() {
         return std::make_unique<FlIvfPqConfig>();
+    }
+
+    static bool
+    StaticHasRawData(const knowhere::BaseConfig& /*config*/, const IndexVersion& /*version*/) {
+        return false;  // PQ keeps quantized codes only
     }
 
     std::unique_ptr<BaseConfig>
@@ -445,7 +471,11 @@ class FlIvfPqIndexNode : public IndexNode {
                                   << " bytes; IVF_PQ on CPU fallback";
             return;
         }
-        if (ops->set_device == nullptr || ops->malloc == nullptr || ops->memcpy_h2d == nullptr || ops->set_device(0) != 0) {
+        if (ops->set_device == nullptr || ops->malloc == nullptr || ops->memcpy_h2d == nullptr) {
+            return;
+        }
+        device_id_ = fl::FlDeviceRouter::Instance().Acquire();
+        if (ops->set_device(device_id_) != 0) {
             return;
         }
         void* d_cb = ops->malloc(cb_bytes);
@@ -496,6 +526,7 @@ class FlIvfPqIndexNode : public IndexNode {
     fl::FlDeviceBuffer dev_codebooks_;
     fl::FlDeviceBuffer dev_codes_;
     bool dev_ready_{false};
+    int device_id_{0};  // bound at staging time via FlDeviceRouter (multi-device)
 };
 
 }  // namespace knowhere

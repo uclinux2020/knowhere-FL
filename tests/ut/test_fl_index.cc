@@ -25,6 +25,7 @@
 #include "catch2/catch_approx.hpp"
 #include "catch2/catch_test_macros.hpp"
 #include "common/fl/fl_device.h"
+#include "common/fl/fl_device_router.h"
 #include "common/fl/fl_host_adapter.h"
 #include "knowhere/comp/index_param.h"
 #include "knowhere/index/index_factory.h"
@@ -372,6 +373,56 @@ TEST_CASE("FL_IVF_PQ rejects invalid train params", "[fl]") {
     // COSINE rejected per design D4
     knowhere::Json cosine = knowhere::Json::parse(R"({"metric_type":"COSINE","dim":16,"nlist":16,"m":4,"nbits":8})");
     REQUIRE(idx.Build(base, cosine) == knowhere::Status::invalid_metric_type);
+}
+
+TEST_CASE("FL device router round-robin", "[fl]") {
+    auto& router = knowhere::fl::FlDeviceRouter::Instance();
+    router.Reset();
+    knowhere::fl::UnregisterHostAdapter();
+    // no adapter -> single-device semantics
+    REQUIRE(router.Acquire() == 0);
+    // host adapter reports exactly 1 emulated device -> always 0
+    REQUIRE(knowhere::fl::RegisterHostAdapter());
+    REQUIRE(router.Acquire() == 0);
+    REQUIRE(router.Acquire() == 0);
+    knowhere::fl::UnregisterHostAdapter();
+}
+
+TEST_CASE("FL_BRUTE_FORCE GetVectorByIds returns raw vectors", "[fl]") {
+    knowhere::fl::UnregisterHostAdapter();
+    auto base = GenDataSet(kNb, kDim, 42);
+    auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_BRUTEFORCE);
+    knowhere::Json build = knowhere::Json::parse(R"({"metric_type":"L2","dim":16})");
+    REQUIRE(idx.Build(base, build) == knowhere::Status::success);
+
+    REQUIRE(idx.HasRawData("L2"));
+
+    std::vector<int64_t> want{0, 7, 123, 1999};
+    auto ids_ds = knowhere::GenIdsDataSet(want.size(), want.data());
+    auto res = idx.GetVectorByIds(ids_ds);
+    REQUIRE(res.has_value());
+    const float* got = static_cast<const float*>(res.value()->GetTensor());
+    const float* src = static_cast<const float*>(base->GetTensor());
+    for (size_t i = 0; i < want.size(); ++i) {
+        for (int64_t d = 0; d < kDim; ++d) {
+            REQUIRE(got[i * kDim + d] == src[want[i] * kDim + d]);
+        }
+    }
+}
+
+TEST_CASE("FL_IVF_PQ reports no raw data", "[fl]") {
+    knowhere::fl::UnregisterHostAdapter();
+    auto base = GenDataSet(kNb, kDim, 42);
+    auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFPQ);
+    knowhere::Json build = knowhere::Json::parse(R"({"metric_type":"L2","dim":16,"nlist":16,"m":4,"nbits":8})");
+    REQUIRE(idx.Build(base, build) == knowhere::Status::success);
+
+    REQUIRE_FALSE(idx.HasRawData("L2"));
+    int64_t query_id = 5;
+    auto ids_ds = knowhere::GenIdsDataSet(1, &query_id);
+    auto r = idx.GetVectorByIds(ids_ds);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(r.error() == knowhere::Status::not_implemented);
 }
 
 #endif  // KNOWHERE_WITH_FL

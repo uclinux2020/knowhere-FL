@@ -34,6 +34,8 @@ class KnowhereConan(ConanFile):
         "with_svs": [True, False],
         "with_cardinal": [True, False],
         "with_gpu": [True, False],
+        "with_fl": [True, False],
+        "with_fl_ppu": [True, False],
         "cardinal_version_force_checkout": [True, False],
         "with_profiler": [True, False],
         "with_ut": [True, False],
@@ -55,6 +57,8 @@ class KnowhereConan(ConanFile):
         "with_svs": False,
         "with_cardinal": False,
         "with_gpu": False,
+        "with_fl": False,
+        "with_fl_ppu": False,
         "metis/*:with_64bit_types": True,
         "cardinal_version_force_checkout": False,
         "with_profiler": False,
@@ -245,6 +249,8 @@ class KnowhereConan(ConanFile):
         tc.variables["WITH_SVS"] = self.options.with_svs
         tc.cache_variables["WITH_CARDINAL"] = bool(self.options.with_cardinal)
         tc.cache_variables["WITH_GPU"] = bool(self.options.with_gpu)
+        tc.cache_variables["WITH_FL"] = bool(self.options.with_fl)
+        tc.cache_variables["WITH_FL_PPU"] = bool(self.options.with_fl_ppu)
         tc.variables["CARDINAL_VERSION_FORCE_CHECKOUT"] = self.options.cardinal_version_force_checkout
         tc.cache_variables["WITH_CUVS"] = bool(self.options.with_cuvs)
         tc.variables["WITH_PROFILER"] = self.options.with_profiler

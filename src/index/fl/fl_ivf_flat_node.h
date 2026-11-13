@@ -25,6 +25,8 @@
 #include <vector>
 
 #include "common/fl/fl_device.h"
+#include "common/fl/fl_device_router.h"
+#include "index/fl/fl_format.h"
 #include "index/fl/fl_ivf_flat_config.h"
 #include "io/memory_io.h"
 #include "knowhere/binaryset.h"
@@ -140,7 +142,9 @@ class FlIvfFlatIndexNode : public IndexNode {
         bool done = false;
         if (dev_ready_) {
             const fl::FlDeviceOps* ops = fl::GetDeviceOps();
-            if (ops->ivf_flat_scan != nullptr) {
+            if (ops->set_device != nullptr && ops->set_device(device_id_) != 0) {
+                LOG_KNOWHERE_WARNING_ << "FL set_device failed in IVF_FLAT search";
+            } else if (ops->ivf_flat_scan != nullptr) {
                 const size_t q_bytes = static_cast<size_t>(nq) * dim_ * sizeof(float);
                 void* d_q = ops->malloc(q_bytes);
                 if (d_q != nullptr && ops->memcpy_h2d(d_q, xq, q_bytes, nullptr) == 0) {
@@ -172,6 +176,35 @@ class FlIvfFlatIndexNode : public IndexNode {
     }
 
     expected<DataSetPtr>
+    GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* /*op_context*/ = nullptr) const override {
+        if (dataset == nullptr) {
+            return expected<DataSetPtr>::Err(Status::invalid_args, "GetVectorByIds dataset is null");
+        }
+        std::vector<int64_t> in_ids;
+        const Status status = this->CompactOutToIn(dataset->GetIds(), dataset->GetRows(), in_ids);
+        if (status != Status::success) {
+            return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
+        }
+        const int64_t rows = static_cast<int64_t>(in_ids.size());
+        if (rows == 0) {
+            return GenResultDataSet(0, dim_, nullptr);
+        }
+        auto* data = new (std::nothrow) float[static_cast<size_t>(rows) * dim_];
+        if (data == nullptr) {
+            return expected<DataSetPtr>::Err(Status::malloc_error, "GetVectorByIds alloc failed");
+        }
+        for (int64_t i = 0; i < rows; ++i) {
+            std::memcpy(data + i * dim_, host_xb_.data() + in_ids[i] * dim_, dim_ * sizeof(float));
+        }
+        return GenResultDataSet(rows, dim_, data);
+    }
+
+    bool
+    HasRawData(const std::string& /*metric_type*/) const override {
+        return true;  // FL IVF_FLAT retains raw fp32 vectors (host_xb_)
+    }
+
+    expected<DataSetPtr>
     GetIndexMeta(std::unique_ptr<Config>) const override {
         return expected<DataSetPtr>::Err(Status::not_implemented, "GetIndexMeta not implemented");
     }
@@ -183,6 +216,7 @@ class FlIvfFlatIndexNode : public IndexNode {
         }
         try {
             MemoryIOWriter writer;
+            fl::WriteFormatHeader(writer);
             writer(&dim_, sizeof(dim_), 1);
             writer(&nb_, sizeof(nb_), 1);
             writer(&nlist_, sizeof(nlist_), 1);
@@ -212,6 +246,9 @@ class FlIvfFlatIndexNode : public IndexNode {
             return Status::invalid_binary_set;
         }
         MemoryIOReader reader(binary->data.get(), binary->size);
+        if (!fl::ReadFormatHeader(reader, "IVF_FLAT")) {
+            return Status::invalid_binary_set;
+        }
         reader(&dim_, sizeof(dim_), 1);
         reader(&nb_, sizeof(nb_), 1);
         reader(&nlist_, sizeof(nlist_), 1);
@@ -245,6 +282,11 @@ class FlIvfFlatIndexNode : public IndexNode {
     static std::unique_ptr<BaseConfig>
     StaticCreateConfig() {
         return std::make_unique<FlIvfFlatConfig>();
+    }
+
+    static bool
+    StaticHasRawData(const knowhere::BaseConfig& /*config*/, const IndexVersion& /*version*/) {
+        return true;  // FL IVF_FLAT retains raw fp32 vectors
     }
 
     std::unique_ptr<BaseConfig>
@@ -303,7 +345,8 @@ class FlIvfFlatIndexNode : public IndexNode {
         if (use_device_assign_ && fl::DeviceAvailable()) {
             ops = fl::GetDeviceOps();
             if (ops->kmeans_assign != nullptr && ops->malloc != nullptr && ops->free != nullptr &&
-                ops->memcpy_h2d != nullptr && ops->set_device != nullptr && ops->set_device(0) == 0 &&
+                ops->memcpy_h2d != nullptr && ops->set_device != nullptr &&
+                ops->set_device(fl::FlDeviceRouter::Instance().Acquire()) == 0 &&
                 fl::FlMemoryPool::Instance().Ensure(x_bytes + c_bytes)) {
                 d_x = ops->malloc(x_bytes);
                 d_c = ops->malloc(c_bytes);
@@ -396,7 +439,8 @@ class FlIvfFlatIndexNode : public IndexNode {
             const size_t x_bytes = static_cast<size_t>(nb) * dim_ * sizeof(float);
             const size_t c_bytes = static_cast<size_t>(nlist_) * dim_ * sizeof(float);
             if (ops->kmeans_assign != nullptr && ops->malloc != nullptr && ops->free != nullptr &&
-                ops->memcpy_h2d != nullptr && ops->set_device != nullptr && ops->set_device(0) == 0 &&
+                ops->memcpy_h2d != nullptr && ops->set_device != nullptr &&
+                ops->set_device(fl::FlDeviceRouter::Instance().Acquire()) == 0 &&
                 fl::FlMemoryPool::Instance().Ensure(x_bytes + c_bytes)) {
                 void* d_x = ops->malloc(x_bytes);
                 void* d_c = ops->malloc(c_bytes);
@@ -554,7 +598,11 @@ class FlIvfFlatIndexNode : public IndexNode {
             LOG_KNOWHERE_WARNING_ << "FL memory pool rejects staging " << bytes << " bytes; IVF_FLAT on CPU fallback";
             return;
         }
-        if (ops->set_device == nullptr || ops->malloc == nullptr || ops->memcpy_h2d == nullptr || ops->set_device(0) != 0) {
+        if (ops->set_device == nullptr || ops->malloc == nullptr || ops->memcpy_h2d == nullptr) {
+            return;
+        }
+        device_id_ = fl::FlDeviceRouter::Instance().Acquire();
+        if (ops->set_device(device_id_) != 0) {
             return;
         }
         void* d = ops->malloc(bytes);
@@ -595,6 +643,7 @@ class FlIvfFlatIndexNode : public IndexNode {
     std::vector<std::vector<int64_t>> invlists_;
     fl::FlDeviceBuffer dev_xb_;
     bool dev_ready_{false};
+    int device_id_{0};  // bound at staging time via FlDeviceRouter (multi-device)
 };
 
 }  // namespace knowhere

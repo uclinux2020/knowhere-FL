@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "knowhere/index/index_static.h"
 #include "common/fl/fl_device.h"
 #include "common/fl/fl_device_router.h"
 #include "index/fl/fl_brute_force_config.h"
@@ -213,6 +214,19 @@ class FlBruteForceIndexNode : public IndexNode {
     static bool
     StaticHasRawData(const knowhere::BaseConfig& /*config*/, const IndexVersion& /*version*/) {
         return true;  // FL brute force always retains raw fp32 vectors
+    }
+
+    // Milvus calls this before loading a segment to budget memory. FL brute
+    // force stages the whole (already raw fp32) binary onto the device, so
+    // the cost is ~1x the file size on device + a transient host copy.
+    static expected<Resource>
+    StaticEstimateLoadResource(const uint64_t file_size_in_bytes, const int64_t /*num_rows*/,
+                               const int64_t /*dim*/, const knowhere::BaseConfig& /*config*/,
+                               const IndexVersion& /*version*/) {
+        Resource res;
+        res.memoryCost = file_size_in_bytes;  // device-resident raw vectors
+        res.diskCost = 0;                     // mmap/source managed by Milvus
+        return res;
     }
 
     std::unique_ptr<BaseConfig>

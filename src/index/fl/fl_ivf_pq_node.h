@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "knowhere/index/index_static.h"
 #include "common/fl/fl_device.h"
 #include "common/fl/fl_device_router.h"
 #include "index/fl/fl_format.h"
@@ -302,6 +303,22 @@ class FlIvfPqIndexNode : public IndexNode {
     static bool
     StaticHasRawData(const knowhere::BaseConfig& /*config*/, const IndexVersion& /*version*/) {
         return false;  // PQ keeps quantized codes only
+    }
+
+    // Device-resident cost ~= the nb*m uint8 code payload; codebooks and
+    // coarse centroids stay on host and are small (m*ksub*dsub*4).
+    static expected<Resource>
+    StaticEstimateLoadResource(const uint64_t file_size_in_bytes, const int64_t num_rows, const int64_t dim,
+                               const knowhere::BaseConfig& config, const IndexVersion& /*version*/) {
+        Resource res;
+        int64_t m = dim > 0 ? dim / 2 : 1;  // FlIvfPqConfig default
+        if (const auto* pq_cfg = dynamic_cast<const FlIvfPqConfig*>(&config)) {
+            m = pq_cfg->m.value();
+        }
+        res.memoryCost = static_cast<uint64_t>(num_rows) * static_cast<uint64_t>(std::max<int64_t>(m, 1));
+        (void)file_size_in_bytes;
+        res.diskCost = 0;
+        return res;
     }
 
     std::unique_ptr<BaseConfig>

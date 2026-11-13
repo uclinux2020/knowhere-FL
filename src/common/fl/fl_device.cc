@@ -11,6 +11,8 @@
 
 #include "common/fl/fl_device.h"
 
+#include <cstdlib>
+
 #include "knowhere/log.h"
 
 namespace knowhere {
@@ -18,6 +20,23 @@ namespace fl {
 
 namespace {
 const FlDeviceOps* g_ops = nullptr;
+
+// Parses a non-negative MiB value from an env var; returns -1 when unset or
+// invalid. Defined for ConfigureFromEnv only.
+long long
+ParseEnvMiB(const char* name) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') {
+        return -1;
+    }
+    char* end = nullptr;
+    const long long v = std::strtoll(raw, &end, 10);
+    if (end == raw || *end != '\0' || v < 0) {
+        LOG_KNOWHERE_WARNING_ << "FL memory pool: ignoring invalid " << name << "=\"" << raw << "\"";
+        return -1;
+    }
+    return v;
+}
 }  // namespace
 
 const FlDeviceOps*
@@ -28,8 +47,38 @@ GetDeviceOps() {
 void
 RegisterDeviceOps(const FlDeviceOps* ops) {
     g_ops = ops;
+    FlMemoryPool::Instance().ConfigureFromEnv();
     LOG_KNOWHERE_INFO_ << "FL device ops registered, device_count="
                        << ((ops != nullptr && ops->device_count != nullptr) ? ops->device_count() : 0);
+}
+
+void
+FlMemoryPool::ConfigureFromEnv() {
+    const long long init_mb = ParseEnvMiB("KNOWHERE_FL_POOL_INIT_MB");
+    const long long max_mb = ParseEnvMiB("KNOWHERE_FL_POOL_MAX_MB");
+    if (init_mb < 0 && max_mb < 0) {
+        return;  // defaults preserved
+    }
+    size_t init_bytes = 0;
+    size_t max_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        init_bytes = init_bytes_;
+        max_bytes = max_bytes_;
+    }
+    constexpr size_t kMiB = 1024ull * 1024ull;
+    if (init_mb >= 0) {
+        init_bytes = static_cast<size_t>(init_mb) * kMiB;
+    }
+    if (max_mb >= 0) {
+        max_bytes = static_cast<size_t>(max_mb) * kMiB;
+    }
+    if (max_bytes != 0 && max_bytes < init_bytes) {
+        LOG_KNOWHERE_WARNING_ << "FL memory pool: max < init, clamping max to init";
+        max_bytes = init_bytes;
+    }
+    Configure(init_bytes, max_bytes);
+    LOG_KNOWHERE_INFO_ << "FL memory pool configured from env: init=" << init_bytes << "B max=" << max_bytes << "B";
 }
 
 bool

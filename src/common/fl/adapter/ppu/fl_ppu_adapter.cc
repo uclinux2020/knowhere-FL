@@ -67,6 +67,7 @@ namespace {
 constexpr const char* kBruteForceTopKArtifact = "fl_kernels/brute_force_topk.ppuo";
 constexpr const char* kKmeansAssignArtifact = "fl_kernels/kmeans_assign.ppuo";
 constexpr const char* kIvfPqScanArtifact = "fl_kernels/ivf_pq_scan.ppuo";
+constexpr const char* kGraphSearchArtifact = "fl_kernels/graph_search.ppuo";
 
 int
 ppu_brute_force_topk(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int64_t k, int metric,
@@ -120,6 +121,23 @@ ppu_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, co
     return -1;
 }
 
+int
+ppu_graph_search(const void* xb, int64_t nb, int64_t dim, const int64_t* graph_ids, const int64_t* graph_offsets,
+                 int64_t max_degree, const void* xq, int64_t nq, int64_t k, int64_t itopk, int metric,
+                 float* out_dist, int64_t* out_ids, void* stream) {
+    // TODO(PPU): upload the graph CSR, launch the greedy traversal kernel.
+    // Graph traversal is the highest-risk kernel in the plan (irregular
+    // control flow, small per-step parallelism); the sanctioned fallback is
+    // adapt_for_cpu-style: build on device later, search on CPU. Until the
+    // AOT artifact exists, return -1 so the caller uses the CPU traversal
+    // (design D5), matching the plan's Phase 2.3 downgrade path.
+    (void)xb; (void)nb; (void)dim; (void)graph_ids; (void)graph_offsets;
+    (void)max_degree; (void)xq; (void)nq; (void)k; (void)itopk; (void)metric;
+    (void)out_dist; (void)out_ids; (void)stream;
+    (void)kGraphSearchArtifact;
+    return -1;
+}
+
 const FlDeviceOps g_ppu_ops = {
     hgDeviceCount,     hgSetDevice,      hgDeviceSynchronize,
     hgMemAlloc,        [](void* p) { (void)hgMemFree(p); },
@@ -129,6 +147,7 @@ const FlDeviceOps g_ppu_ops = {
     ppu_ivf_flat_scan,
     ppu_kmeans_assign,
     ppu_ivf_pq_scan,
+    ppu_graph_search,
 };
 
 }  // namespace

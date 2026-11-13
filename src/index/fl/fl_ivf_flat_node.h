@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "knowhere/index/index_static.h"
 #include "common/fl/fl_device.h"
 #include "common/fl/fl_device_router.h"
 #include "index/fl/fl_format.h"
@@ -287,6 +288,18 @@ class FlIvfFlatIndexNode : public IndexNode {
     static bool
     StaticHasRawData(const knowhere::BaseConfig& /*config*/, const IndexVersion& /*version*/) {
         return true;  // FL IVF_FLAT retains raw fp32 vectors
+    }
+
+    // Device-resident cost ~= raw vector payload; centroids + invlists are
+    // host-side and negligible relative to nb*dim*4.
+    static expected<Resource>
+    StaticEstimateLoadResource(const uint64_t file_size_in_bytes, const int64_t num_rows, const int64_t dim,
+                               const knowhere::BaseConfig& /*config*/, const IndexVersion& /*version*/) {
+        Resource res;
+        res.memoryCost = static_cast<uint64_t>(num_rows) * static_cast<uint64_t>(dim) * sizeof(float);
+        (void)file_size_in_bytes;  // layout-dependent; row/col estimate is stabler
+        res.diskCost = 0;
+        return res;
     }
 
     std::unique_ptr<BaseConfig>

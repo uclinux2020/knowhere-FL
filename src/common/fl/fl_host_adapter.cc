@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "common/fl/fl_device.h"
+#include "common/fl/fl_graph_search_cpu.h"
 #include "knowhere/log.h"
 
 namespace knowhere {
@@ -265,6 +266,22 @@ host_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, c
     return 0;
 }
 
+// Reference greedy graph traversal (CAGRA-like search). The semantics
+// contract for device kernels lives in common/fl/fl_graph_search_cpu.h; the
+// device graph_search kernel must reproduce it exactly.
+int
+host_graph_search(const void* xb, int64_t nb, int64_t dim, const int64_t* graph_ids, const int64_t* graph_offsets,
+                  int64_t max_degree, const void* xq, int64_t nq, int64_t k, int64_t itopk, int metric,
+                  float* out_dist, int64_t* out_ids, void* /*stream*/) {
+    if (xb == nullptr || graph_ids == nullptr || graph_offsets == nullptr || xq == nullptr || out_dist == nullptr ||
+        out_ids == nullptr || nb <= 0 || dim <= 0 || k <= 0 || max_degree <= 0) {
+        return -1;
+    }
+    FlGraphSearchCpu(static_cast<const float*>(xb), nb, dim, graph_ids, graph_offsets, max_degree,
+                     static_cast<const float*>(xq), nq, k, itopk, metric, out_dist, out_ids);
+    return 0;
+}
+
 const FlDeviceOps g_host_ops = {
     host_device_count, host_set_device, host_device_sync,
     host_malloc,       host_free,       host_memcpy,
@@ -274,6 +291,7 @@ const FlDeviceOps g_host_ops = {
     host_ivf_flat_scan,
     host_kmeans_assign,
     host_ivf_pq_scan,
+    host_graph_search,
 };
 
 }  // namespace

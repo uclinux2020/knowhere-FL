@@ -87,6 +87,7 @@ static std::set<std::pair<std::string, VecType>> legal_knowhere_index = {
     {IndexEnum::INDEX_FL_BRUTEFORCE, VecType::VECTOR_FLOAT},
     {IndexEnum::INDEX_FL_IVFFLAT, VecType::VECTOR_FLOAT},
     {IndexEnum::INDEX_FL_IVFPQ, VecType::VECTOR_FLOAT},
+    {IndexEnum::INDEX_FL_CAGRA, VecType::VECTOR_FLOAT},
 
     // hnsw
     {IndexEnum::INDEX_HNSW, VecType::VECTOR_FLOAT},

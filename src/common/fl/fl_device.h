@@ -94,6 +94,17 @@ struct FlDeviceOps {
     int (*ivf_pq_scan)(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, const void* codes, int64_t nb,
                        const void* xq, int64_t nq, int64_t dim, const int64_t* cand_ids, const int64_t* cand_offsets,
                        int64_t k, int metric, float* out_dist, int64_t* out_ids, void* stream);
+
+    // graph_search: greedy top-k traversal of a kNN graph (CAGRA-like).
+    //   xb/xq are DEVICE pointers; graph CSR (graph_ids concatenated
+    //   neighbor ids, graph_offsets nb+1 prefix offsets, max_degree padded
+    //   row stride) is HOST and uploaded by the adapter. Traversal keeps a
+    //   candidate frontier of `itopk` entries per query. out_* are HOST.
+    //   Returns 0 on success. May be nullptr -> caller falls back to the
+    //   CPU traversal (the adapt_for_cpu-style mode from the plan).
+    int (*graph_search)(const void* xb, int64_t nb, int64_t dim, const int64_t* graph_ids,
+                        const int64_t* graph_offsets, int64_t max_degree, const void* xq, int64_t nq, int64_t k,
+                        int64_t itopk, int metric, float* out_dist, int64_t* out_ids, void* stream);
 };
 
 // Returns the currently registered ops table, or nullptr when no chip adapter
@@ -137,6 +148,15 @@ class FlMemoryPool {
         init_bytes_ = init_bytes;
         max_bytes_ = max_bytes;
     }
+
+    // Read pool limits from the environment (called automatically by
+    // RegisterDeviceOps; can be called again to re-apply):
+    //   KNOWHERE_FL_POOL_INIT_MB - initial reservation hint, MiB (default 0)
+    //   KNOWHERE_FL_POOL_MAX_MB  - hard ceiling, MiB (default 0 = unlimited)
+    // Values < 0 or unparseable are ignored with a warning. A max < init is
+    // clamped to init. Defined in fl_device.cc.
+    void
+    ConfigureFromEnv();
 
     // Pre-flight admission check for an upcoming allocation of `bytes`.
     // Returns true when the allocation fits within max_bytes_. Reserving here

@@ -60,6 +60,7 @@ constexpr const char* INDEX_GPU_CAGRA = "GPU_CAGRA";
 constexpr const char* INDEX_FL_BRUTEFORCE = "FL_BRUTE_FORCE";
 constexpr const char* INDEX_FL_IVFFLAT = "FL_IVF_FLAT";
 constexpr const char* INDEX_FL_IVFPQ = "FL_IVF_PQ";
+constexpr const char* INDEX_FL_CAGRA = "FL_CAGRA";
 
 constexpr const char* INDEX_HNSW = "HNSW";
 constexpr const char* INDEX_HNSW_SQ = "HNSW_SQ";

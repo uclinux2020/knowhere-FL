@@ -70,6 +70,17 @@ struct FlDeviceOps {
     int (*ivf_flat_scan)(const void* xb, int64_t nb, int64_t dim, const void* xq, int64_t nq, const int64_t* cand_ids,
                          const int64_t* cand_offsets, int64_t k, int metric, float* out_dist, int64_t* out_ids,
                          void* stream);
+
+    // kmeans_assign: routes every base vector to its nearest centroid
+    // (mm + argmin composition; no atomics, safe on all FlagOS targets).
+    //   xb/centroids are DEVICE pointers; assign (nb centroid ids) is HOST.
+    //   Returns 0 on success. May be nullptr -> caller falls back to CPU
+    //   routing. Centroid *update* is intentionally NOT a device op in v1:
+    //   it needs atomic index_add whose PPU performance must be measured
+    //   first (see python/fl_kernels/kmeans_composition.py), so the update
+    //   step stays on CPU until the benchmark clears it.
+    int (*kmeans_assign)(const void* xb, int64_t nb, int64_t dim, const void* centroids, int64_t nlist, int metric,
+                         int64_t* assign, void* stream);
 };
 
 // Returns the currently registered ops table, or nullptr when no chip adapter

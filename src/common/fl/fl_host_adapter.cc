@@ -102,7 +102,6 @@ host_topk_over_candidates(const float* xb, int64_t dim, const float* xq, int64_t
         const int64_t nc = cand_counts[i];
         using Cand = std::pair<float, int64_t>;
         const bool is_ip = (metric == 1);
-        auto cmp = [is_ip](const Cand& a, const Cand& b) { return is_ip ? (a.first > b.first) : (a.first < b.first); };
         // simple selection: keep an unsorted buffer of k best
         std::vector<Cand> best;
         best.reserve(static_cast<size_t>(k) + 1);
@@ -178,6 +177,33 @@ host_ivf_flat_scan(const void* xb, int64_t /*nb*/, int64_t dim, const void* xq, 
     return 0;
 }
 
+int
+host_kmeans_assign(const void* xb, int64_t nb, int64_t dim, const void* centroids, int64_t nlist, int metric,
+                   int64_t* assign, void* /*stream*/) {
+    if (xb == nullptr || centroids == nullptr || assign == nullptr || nlist <= 0) {
+        return -1;
+    }
+    const float* base = static_cast<const float*>(xb);
+    const float* cent = static_cast<const float*>(centroids);
+    // Reference semantics for the device kernel: per-vector argmin over
+    // centroids (argmax for IP). Pure mm + argmin composition, no atomics.
+#pragma omp parallel for schedule(static)
+    for (int64_t j = 0; j < nb; ++j) {
+        const float* v = base + j * dim;
+        float best = metric == 1 ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+        int64_t best_id = 0;
+        for (int64_t c = 0; c < nlist; ++c) {
+            const float d = host_distance(v, cent + c * dim, dim, metric);
+            if ((metric == 1 && d > best) || (metric == 0 && d < best)) {
+                best = d;
+                best_id = c;
+            }
+        }
+        assign[j] = best_id;
+    }
+    return 0;
+}
+
 const FlDeviceOps g_host_ops = {
     host_device_count, host_set_device, host_device_sync,
     host_malloc,       host_free,       host_memcpy,
@@ -185,6 +211,7 @@ const FlDeviceOps g_host_ops = {
     host_stream_create, host_stream_destroy, host_stream_sync,
     host_brute_force_topk,
     host_ivf_flat_scan,
+    host_kmeans_assign,
 };
 
 }  // namespace

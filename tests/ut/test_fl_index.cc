@@ -249,4 +249,40 @@ TEST_CASE("FL_IVF_FLAT serialize/deserialize round trip", "[fl]") {
     REQUIRE(RecallAtK(res.value(), truth, kNq, kK) == 1.0f);
 }
 
+TEST_CASE("FL_IVF_FLAT device-assign and CPU routing agree", "[fl]") {
+    // With the host adapter registered, kmeans assignment routes through the
+    // emulated device (ops->kmeans_assign). use_device_assign=false must give
+    // identical recall via pure CPU routing (design D5 fallback parity).
+    knowhere::fl::UnregisterHostAdapter();
+    REQUIRE(knowhere::fl::RegisterHostAdapter());
+    knowhere::fl::FlMemoryPool::Instance().Configure(0, 0);
+
+    auto base = GenDataSet(kNb, kDim, 42);
+    auto query = GenDataSet(kNq, kDim, 7);
+    knowhere::Json search = knowhere::Json::parse(R"({"metric_type":"L2","k":10,"nprobe":16})");
+    auto truth = ExactKnn(static_cast<const float*>(base->GetTensor()), static_cast<const float*>(query->GetTensor()),
+                          kNb, kNq, kDim, kK, /*is_ip=*/false);
+
+    auto idx_dev = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
+    REQUIRE(idx_dev.Build(base, knowhere::Json::parse(
+                                      R"({"metric_type":"L2","dim":16,"nlist":16,"use_device_assign":true})")) ==
+            knowhere::Status::success);
+    auto res_dev = idx_dev.Search(query, search);
+    REQUIRE(res_dev.has_value());
+
+    auto idx_cpu = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
+    REQUIRE(idx_cpu.Build(base, knowhere::Json::parse(
+                                      R"({"metric_type":"L2","dim":16,"nlist":16,"use_device_assign":false})")) ==
+            knowhere::Status::success);
+    auto res_cpu = idx_cpu.Search(query, search);
+    REQUIRE(res_cpu.has_value());
+
+    // both paths are exact at nprobe==nlist regardless of routing mode
+    REQUIRE(RecallAtK(res_dev.value(), truth, kNq, kK) == 1.0f);
+    REQUIRE(RecallAtK(res_cpu.value(), truth, kNq, kK) == 1.0f);
+
+    knowhere::fl::FlMemoryPool::Instance().Configure(0, 0);
+    knowhere::fl::UnregisterHostAdapter();
+}
+
 #endif  // KNOWHERE_WITH_FL

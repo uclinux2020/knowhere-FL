@@ -26,6 +26,7 @@ namespace knowhere {
 struct FlIvfFlatConfig : public BaseConfig {
     CFG_INT nlist;
     CFG_INT nprobe;
+    CFG_BOOL use_device_assign;
     KNOWHERE_DECLARE_CONFIG(FlIvfFlatConfig) {
         KNOWHERE_CONFIG_DECLARE_FIELD(nlist)
             .description("number of inverted lists")
@@ -37,6 +38,11 @@ struct FlIvfFlatConfig : public BaseConfig {
             .set_default(8)
             .for_search()
             .set_range(1, 65536);
+        KNOWHERE_CONFIG_DECLARE_FIELD(use_device_assign)
+            .description("route vectors to centroids on the FL device during kmeans/add "
+                         "(mm+argmin composition, no atomics); set false to force CPU routing")
+            .set_default(true)
+            .for_train();
     }
 
     Status

@@ -42,10 +42,10 @@ namespace knowhere {
 // FlIvfFlatIndexNode (GPU_IVF_FLAT / FL_IVF_FLAT on the FL path)
 //
 // v1 design (per plan, Phase 1.2/1.3 with the documented fallback):
-//   - Train: CPU Lloyd kmeans. The FlagGems-composed device kmeans
-//     (mm+argmin+index_add) lands after its PPU atomics micro-benchmark;
-//     until then "CPU trains centroids, device does assignment/scan" is the
-//     sanctioned mode (plan section 5.2 fallback).
+//   - Train: Lloyd kmeans. Assignment (mm+argmin, no atomics) runs on the
+//     device via ops->kmeans_assign when available (xb staged once per Train);
+//     centroid update stays on CPU until the PPU atomics micro-benchmark
+//     (python/fl_kernels/kmeans_composition.py) clears index_add performance.
 //   - Add: assign each vector to its nearest centroid, build inverted lists,
 //     stage raw vectors to the FL device (with OOM pre-check, design D5).
 //   - Search: centroid routing on host (nq x nlist, cheap), candidate member
@@ -75,6 +75,7 @@ class FlIvfFlatIndexNode : public IndexNode {
         if (nlist_ <= 0) {
             return Status::invalid_args;
         }
+        use_device_assign_ = f_cfg.use_device_assign.value();
 
         const auto* x = static_cast<const float*>(dataset->GetTensor());
         const int64_t nb = dataset->GetRows();
@@ -82,7 +83,7 @@ class FlIvfFlatIndexNode : public IndexNode {
             LOG_KNOWHERE_ERROR_ << "FL IVF_FLAT train: invalid dataset";
             return Status::invalid_args;
         }
-        TrainKmeansCpu(x, nb);
+        TrainKmeans(x, nb);
         return Status::success;
     }
 
@@ -101,10 +102,7 @@ class FlIvfFlatIndexNode : public IndexNode {
 
         invlists_.assign(nlist_, {});
         assign_.resize(nb_);
-#pragma omp parallel for schedule(static)
-        for (int64_t j = 0; j < nb_; ++j) {
-            assign_[j] = NearestCentroid(host_xb_.data() + j * dim_);
-        }
+        AssignAll(host_xb_.data(), nb_, assign_.data());
         for (int64_t j = 0; j < nb_; ++j) {
             invlists_[assign_[j]].push_back(j);
         }
@@ -275,9 +273,13 @@ class FlIvfFlatIndexNode : public IndexNode {
     }
 
  private:
-    // ---- CPU Lloyd kmeans (v1; device kmeans pending PPU atomics bench) ----
+    // ---- Lloyd kmeans: device assignment (mm+argmin, no atomics) + CPU update ----
+    // Per plan Phase 1.2 fallback: centroid *update* (atomic index_add) stays
+    // on CPU until kmeans_composition.py clears PPU atomics performance; the
+    // assignment step (the dominant O(nb*nlist*dim) cost) runs on the device
+    // whenever the adapter provides kmeans_assign and use_device_assign=true.
     void
-    TrainKmeansCpu(const float* x, int64_t nb) {
+    TrainKmeans(const float* x, int64_t nb) {
         constexpr int kMaxIters = 25;
         std::mt19937_64 rng(42);
         centroids_.resize(static_cast<size_t>(nlist_) * dim_);
@@ -290,18 +292,68 @@ class FlIvfFlatIndexNode : public IndexNode {
             std::memcpy(centroids_.data() + l * dim_, x + perm[l] * dim_, dim_ * sizeof(float));
         }
 
+        // Stage xb on the device once for the whole training loop; centroids
+        // are re-uploaded every iteration (they are tiny: nlist * dim).
+        const fl::FlDeviceOps* ops = nullptr;
+        void* d_x = nullptr;
+        void* d_c = nullptr;
+        size_t staged_bytes = 0;
+        const size_t x_bytes = static_cast<size_t>(nb) * dim_ * sizeof(float);
+        const size_t c_bytes = static_cast<size_t>(nlist_) * dim_ * sizeof(float);
+        if (use_device_assign_ && fl::DeviceAvailable()) {
+            ops = fl::GetDeviceOps();
+            if (ops->kmeans_assign != nullptr && ops->malloc != nullptr && ops->free != nullptr &&
+                ops->memcpy_h2d != nullptr && ops->set_device != nullptr && ops->set_device(0) == 0 &&
+                fl::FlMemoryPool::Instance().Ensure(x_bytes + c_bytes)) {
+                d_x = ops->malloc(x_bytes);
+                d_c = ops->malloc(c_bytes);
+                if (d_x != nullptr && d_c != nullptr && ops->memcpy_h2d(d_x, x, x_bytes, nullptr) == 0) {
+                    staged_bytes = x_bytes + c_bytes;
+                    fl::FlMemoryPool::Instance().TrackAlloc(staged_bytes);
+                    LOG_KNOWHERE_INFO_ << "FL IVF_FLAT kmeans: device assignment enabled";
+                } else {
+                    if (d_x != nullptr) {
+                        ops->free(d_x);
+                    }
+                    if (d_c != nullptr) {
+                        ops->free(d_c);
+                    }
+                    d_x = d_c = nullptr;
+                }
+            }
+        }
+
         std::vector<int64_t> owner(nb, -1);
+        std::vector<int64_t> cur(nb, -1);
         for (int iter = 0; iter < kMaxIters; ++iter) {
+            bool assigned_on_device = false;
+            if (d_x != nullptr) {
+                assigned_on_device =
+                    ops->memcpy_h2d(d_c, centroids_.data(), c_bytes, nullptr) == 0 &&
+                    ops->kmeans_assign(d_x, nb, dim_, d_c, nlist_, metric_code_, cur.data(), nullptr) == 0;
+                if (!assigned_on_device) {
+                    LOG_KNOWHERE_WARNING_ << "FL device kmeans_assign failed mid-train; CPU routing from now on";
+                    ops->free(d_x);
+                    ops->free(d_c);
+                    fl::FlMemoryPool::Instance().TrackFree(staged_bytes);
+                    d_x = d_c = nullptr;
+                }
+            }
+            if (!assigned_on_device) {
+#pragma omp parallel for schedule(dynamic)
+                for (int64_t j = 0; j < nb; ++j) {
+                    cur[j] = NearestCentroid(x + j * dim_);
+                }
+            }
             bool changed = false;
-#pragma omp parallel for schedule(dynamic) reduction(| : changed)
+#pragma omp parallel for schedule(static) reduction(| : changed)
             for (int64_t j = 0; j < nb; ++j) {
-                const int64_t c = NearestCentroid(x + j * dim_);
-                if (c != owner[j]) {
-                    owner[j] = c;
+                if (cur[j] != owner[j]) {
+                    owner[j] = cur[j];
                     changed = true;
                 }
             }
-            // recompute centroids
+            // recompute centroids (CPU; device update needs atomics, see header note)
             std::vector<double> sums(static_cast<size_t>(nlist_) * dim_, 0.0);
             std::vector<int64_t> counts(nlist_, 0);
             for (int64_t j = 0; j < nb; ++j) {
@@ -326,7 +378,54 @@ class FlIvfFlatIndexNode : public IndexNode {
                 break;
             }
         }
-        LOG_KNOWHERE_INFO_ << "FL IVF_FLAT kmeans trained: nlist=" << nlist_ << " dim=" << dim_;
+        if (d_x != nullptr) {
+            ops->free(d_x);
+            ops->free(d_c);
+            fl::FlMemoryPool::Instance().TrackFree(staged_bytes);
+        }
+        LOG_KNOWHERE_INFO_ << "FL IVF_FLAT kmeans trained: nlist=" << nlist_ << " dim=" << dim_
+                           << (staged_bytes != 0 ? " (device assignment)" : " (CPU assignment)");
+    }
+
+    // One-shot assignment of vectors to centroids: device kmeans_assign when
+    // available (single upload), CPU parallel routing otherwise.
+    void
+    AssignAll(const float* x, int64_t nb, int64_t* out) const {
+        if (use_device_assign_ && fl::DeviceAvailable()) {
+            const fl::FlDeviceOps* ops = fl::GetDeviceOps();
+            const size_t x_bytes = static_cast<size_t>(nb) * dim_ * sizeof(float);
+            const size_t c_bytes = static_cast<size_t>(nlist_) * dim_ * sizeof(float);
+            if (ops->kmeans_assign != nullptr && ops->malloc != nullptr && ops->free != nullptr &&
+                ops->memcpy_h2d != nullptr && ops->set_device != nullptr && ops->set_device(0) == 0 &&
+                fl::FlMemoryPool::Instance().Ensure(x_bytes + c_bytes)) {
+                void* d_x = ops->malloc(x_bytes);
+                void* d_c = ops->malloc(c_bytes);
+                const bool alloc_ok = d_x != nullptr && d_c != nullptr;
+                if (alloc_ok) {
+                    fl::FlMemoryPool::Instance().TrackAlloc(x_bytes + c_bytes);
+                }
+                bool ok = alloc_ok && ops->memcpy_h2d(d_x, x, x_bytes, nullptr) == 0 &&
+                          ops->memcpy_h2d(d_c, centroids_.data(), c_bytes, nullptr) == 0 &&
+                          ops->kmeans_assign(d_x, nb, dim_, d_c, nlist_, metric_code_, out, nullptr) == 0;
+                if (d_x != nullptr) {
+                    ops->free(d_x);
+                }
+                if (d_c != nullptr) {
+                    ops->free(d_c);
+                }
+                if (alloc_ok) {
+                    fl::FlMemoryPool::Instance().TrackFree(x_bytes + c_bytes);
+                }
+                if (ok) {
+                    return;
+                }
+                LOG_KNOWHERE_WARNING_ << "FL device assignment failed in Add; CPU routing fallback";
+            }
+        }
+#pragma omp parallel for schedule(static)
+        for (int64_t j = 0; j < nb; ++j) {
+            out[j] = NearestCentroid(x + j * dim_);
+        }
     }
 
     int64_t
@@ -488,7 +587,8 @@ class FlIvfFlatIndexNode : public IndexNode {
     int64_t dim_{0};
     int64_t nb_{0};
     int64_t nlist_{0};
-    int metric_code_{0};  // 0 = L2, 1 = IP
+    int metric_code_{0};             // 0 = L2, 1 = IP
+    bool use_device_assign_{true};   // device centroid routing (train/add)
     std::vector<float> centroids_;           // nlist * dim
     std::vector<float> host_xb_;             // nb * dim
     std::vector<int64_t> assign_;            // nb -> list id

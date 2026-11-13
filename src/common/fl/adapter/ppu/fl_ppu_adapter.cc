@@ -65,6 +65,7 @@ namespace {
 // TODO(PPU): artifact locations come from the FlagTree AOT build; wire into
 // milvus.yaml-adjacent config once the kernel set stabilizes (Phase 1).
 constexpr const char* kBruteForceTopKArtifact = "fl_kernels/brute_force_topk.ppuo";
+constexpr const char* kKmeansAssignArtifact = "fl_kernels/kmeans_assign.ppuo";
 
 int
 ppu_brute_force_topk(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int64_t k, int metric,
@@ -90,6 +91,19 @@ ppu_ivf_flat_scan(const void* xb, int64_t nb, int64_t dim, const void* xq, int64
     return -1;
 }
 
+int
+ppu_kmeans_assign(const void* xb, int64_t nb, int64_t dim, const void* centroids, int64_t nlist, int metric,
+                  int64_t* assign, void* stream) {
+    // TODO(PPU): load the FlagTree AOT artifact of the FlagGems mm+argmin
+    // composition (see python/fl_kernels/kmeans_composition.py --emit) and
+    // launch it here via hgAotLaunchAssign. Until wired (Phase 1.2), return
+    // -1 so Train/Add fall back to CPU routing (design D5).
+    (void)xb; (void)nb; (void)dim; (void)centroids; (void)nlist; (void)metric;
+    (void)assign; (void)stream;
+    (void)kKmeansAssignArtifact;
+    return -1;
+}
+
 const FlDeviceOps g_ppu_ops = {
     hgDeviceCount,     hgSetDevice,      hgDeviceSynchronize,
     hgMemAlloc,        [](void* p) { (void)hgMemFree(p); },
@@ -97,6 +111,7 @@ const FlDeviceOps g_ppu_ops = {
     hgStreamCreate,    [](void* s) { (void)hgStreamDestroy(s); }, hgStreamSynchronize,
     ppu_brute_force_topk,
     ppu_ivf_flat_scan,
+    ppu_kmeans_assign,
 };
 
 }  // namespace

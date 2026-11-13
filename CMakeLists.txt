@@ -27,6 +27,13 @@ include(cmake/utils/platform_check.cmake)
 knowhere_option(WITH_CARDINAL "Build with cardinal" OFF)
 knowhere_option(WITH_GPU "Build with GPU support (cuVS or Cardinal)" OFF)
 knowhere_option(WITH_CUVS "Build with CUVS indexes" OFF)
+# FL (FlagOS) backend: domestic-GPU acceleration path based on the FlagOS
+# operator ecosystem (FlagGems / FlagTree). Mutually exclusive with the
+# CUDA/cuVS path (D2 in the Knowhere-FL design doc).
+knowhere_option(WITH_FL "Build with FlagOS FL (domestic GPU) support" OFF)
+if(WITH_FL AND (WITH_GPU OR WITH_CUVS OR WITH_CARDINAL))
+  message(FATAL_ERROR "WITH_FL is mutually exclusive with WITH_GPU/WITH_CUVS/WITH_CARDINAL; pick one acceleration backend per build")
+endif()
 # Select the GPU backend through WITH_CARDINAL.
 # Keep this as a local value so an implicit cuVS selection is not cached when
 # reconfiguring the same build directory for Cardinal.
@@ -299,6 +306,14 @@ if(NOT WITH_CUVS)
   knowhere_file_glob(GLOB_RECURSE KNOWHERE_CUVS_SRCS src/common/cuvs/*.cu
                      src/common/cuvs/*.cc src/index/gpu_cuvs/*.cc)
   list(REMOVE_ITEM KNOWHERE_SRCS ${KNOWHERE_CUVS_SRCS})
+endif()
+
+if(WITH_FL)
+  add_definitions(-DKNOWHERE_WITH_FL)
+else()
+  knowhere_file_glob(GLOB_RECURSE KNOWHERE_FL_SRCS src/common/fl/*.cc
+                     src/index/fl/*.cc)
+  list(REMOVE_ITEM KNOWHERE_SRCS ${KNOWHERE_FL_SRCS})
 endif()
 
 include_directories(src)

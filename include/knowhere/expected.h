@@ -70,6 +70,9 @@ enum class Status {
     // Distinct from `timeout`, which is the Cardinal build-side
     // cancel-or-timeout and cannot say which of the two happened.
     cancelled = 34,
+    // FL (FlagOS domestic-GPU) backend device/runtime errors. Appended at the
+    // end to stay ABI- and upstream-merge friendly.
+    fl_device_error = 35,
 };
 
 enum class StatusCategory {

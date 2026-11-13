@@ -54,6 +54,11 @@ constexpr const char* INDEX_GPU_IVFFLAT = "GPU_IVF_FLAT";
 constexpr const char* INDEX_GPU_IVFPQ = "GPU_IVF_PQ";
 constexpr const char* INDEX_GPU_CAGRA = "GPU_CAGRA";
 
+// FL (FlagOS domestic-GPU) path. GPU_BRUTE_FORCE etc. remain the user-facing
+// names in FL builds (the CUDA path is excluded at build time); FL_* are
+// explicit aliases for debugging and A/B testing.
+constexpr const char* INDEX_FL_BRUTEFORCE = "FL_BRUTE_FORCE";
+
 constexpr const char* INDEX_HNSW = "HNSW";
 constexpr const char* INDEX_HNSW_SQ = "HNSW_SQ";
 constexpr const char* INDEX_HNSW_PQ = "HNSW_PQ";

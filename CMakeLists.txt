@@ -31,6 +31,10 @@ knowhere_option(WITH_CUVS "Build with CUVS indexes" OFF)
 # operator ecosystem (FlagGems / FlagTree). Mutually exclusive with the
 # CUDA/cuVS path (D2 in the Knowhere-FL design doc).
 knowhere_option(WITH_FL "Build with FlagOS FL (domestic GPU) support" OFF)
+knowhere_option(WITH_FL_PPU "Build the FL PPU (Zhenwu/ZW810E) chip adapter; requires PPU_SDK_PATH" OFF)
+if(WITH_FL_PPU AND NOT WITH_FL)
+  message(FATAL_ERROR "WITH_FL_PPU requires WITH_FL=ON")
+endif()
 if(WITH_FL AND (WITH_GPU OR WITH_CUVS OR WITH_CARDINAL))
   message(FATAL_ERROR "WITH_FL is mutually exclusive with WITH_GPU/WITH_CUVS/WITH_CARDINAL; pick one acceleration backend per build")
 endif()
@@ -310,6 +314,24 @@ endif()
 
 if(WITH_FL)
   add_definitions(-DKNOWHERE_WITH_FL)
+  # Optional PPU (Zhenwu/ZW810E) chip adapter. When ON, compiles
+  # src/common/fl/adapter/ppu with KNOWHERE_FL_WITH_PPU and links the PPU
+  # runtime SDK (located via PPU_SDK_PATH env or -DPPU_SDK_PATH=...).
+  # The adapter source compiles to an empty TU when the macro is absent, so
+  # WITH_FL without WITH_FL_PPU stays a portable CPU-fallback build.
+  if(WITH_FL_PPU)
+    add_definitions(-DKNOWHERE_FL_WITH_PPU)
+    if(NOT PPU_SDK_PATH AND DEFINED ENV{PPU_SDK_PATH})
+      set(PPU_SDK_PATH $ENV{PPU_SDK_PATH})
+    endif()
+    if(NOT PPU_SDK_PATH)
+      message(FATAL_ERROR "WITH_FL_PPU requires PPU_SDK_PATH (env or -D) pointing at the PPU runtime SDK")
+    endif()
+    include_directories(${PPU_SDK_PATH}/include)
+    link_directories(${PPU_SDK_PATH}/lib)
+    list(APPEND KNOWHERE_PRIVATE_LIBS ppu_runtime)
+    message(STATUS "FL PPU adapter enabled, SDK: ${PPU_SDK_PATH}")
+  endif()
 else()
   knowhere_file_glob(GLOB_RECURSE KNOWHERE_FL_SRCS src/common/fl/*.cc
                      src/index/fl/*.cc)

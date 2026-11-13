@@ -66,6 +66,7 @@ namespace {
 // milvus.yaml-adjacent config once the kernel set stabilizes (Phase 1).
 constexpr const char* kBruteForceTopKArtifact = "fl_kernels/brute_force_topk.ppuo";
 constexpr const char* kKmeansAssignArtifact = "fl_kernels/kmeans_assign.ppuo";
+constexpr const char* kIvfPqScanArtifact = "fl_kernels/ivf_pq_scan.ppuo";
 
 int
 ppu_brute_force_topk(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int64_t k, int metric,
@@ -104,6 +105,21 @@ ppu_kmeans_assign(const void* xb, int64_t nb, int64_t dim, const void* centroids
     return -1;
 }
 
+int
+ppu_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, const void* codes, int64_t nb,
+                const void* xq, int64_t nq, int64_t dim, const int64_t* cand_ids, const int64_t* cand_offsets,
+                int64_t k, int metric, float* out_dist, int64_t* out_ids, void* stream) {
+    // TODO(PPU): upload cand lists, compute per-query LUTs via the FlagGems mm
+    // composition against reshaped codebooks, then launch the ADC scan kernel
+    // (KernelGen baseline -> FlagGems contribution, Phase 2). Until wired,
+    // return -1 so the caller falls back to the CPU ADC path (design D5).
+    (void)codebooks; (void)m; (void)ksub; (void)dsub; (void)codes; (void)nb;
+    (void)xq; (void)nq; (void)dim; (void)cand_ids; (void)cand_offsets;
+    (void)k; (void)metric; (void)out_dist; (void)out_ids; (void)stream;
+    (void)kIvfPqScanArtifact;
+    return -1;
+}
+
 const FlDeviceOps g_ppu_ops = {
     hgDeviceCount,     hgSetDevice,      hgDeviceSynchronize,
     hgMemAlloc,        [](void* p) { (void)hgMemFree(p); },
@@ -112,6 +128,7 @@ const FlDeviceOps g_ppu_ops = {
     ppu_brute_force_topk,
     ppu_ivf_flat_scan,
     ppu_kmeans_assign,
+    ppu_ivf_pq_scan,
 };
 
 }  // namespace

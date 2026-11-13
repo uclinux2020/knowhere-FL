@@ -81,6 +81,19 @@ struct FlDeviceOps {
     //   step stays on CPU until the benchmark clears it.
     int (*kmeans_assign)(const void* xb, int64_t nb, int64_t dim, const void* centroids, int64_t nlist, int metric,
                          int64_t* assign, void* stream);
+
+    // ivf_pq_scan: per-query top-k over PQ-encoded candidates via ADC
+    // (asymmetric distance computation).
+    //   codebooks (m * ksub * dsub floats) and codes (nb * m uint8, one code
+    //   per subquantizer; v1 supports nbits=8 only) are DEVICE pointers; xq
+    //   is DEVICE; cand_ids/cand_offsets are HOST (the adapter uploads them).
+    //   The adapter computes per-query LUTs (nq x m x ksub, via mm against
+    //   reshaped codebooks - FlagGems composition) on device, then scans
+    //   candidates accumulating LUT entries. out_* are HOST.
+    //   Returns 0 on success. May be nullptr -> caller falls back to CPU ADC.
+    int (*ivf_pq_scan)(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, const void* codes, int64_t nb,
+                       const void* xq, int64_t nq, int64_t dim, const int64_t* cand_ids, const int64_t* cand_offsets,
+                       int64_t k, int metric, float* out_dist, int64_t* out_ids, void* stream);
 };
 
 // Returns the currently registered ops table, or nullptr when no chip adapter

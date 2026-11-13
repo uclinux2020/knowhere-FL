@@ -285,4 +285,93 @@ TEST_CASE("FL_IVF_FLAT device-assign and CPU routing agree", "[fl]") {
     knowhere::fl::UnregisterHostAdapter();
 }
 
+TEST_CASE("FL_IVF_PQ device ADC and CPU fallback agree", "[fl]") {
+    // Host adapter registered -> index stages codebooks/codes on the emulated
+    // device and scans via ops->ivf_pq_scan. A second index built with a
+    // 1-byte pool cap fails the OOM pre-check (D5) and scans on CPU. Both
+    // must return identical top-k ids (deterministic ADC semantics).
+    knowhere::fl::UnregisterHostAdapter();
+    REQUIRE(knowhere::fl::RegisterHostAdapter());
+
+    auto base = GenDataSet(kNb, kDim, 42);
+    auto query = GenDataSet(kNq, kDim, 7);
+    const std::string build_json = R"({"metric_type":"L2","dim":16,"nlist":16,"m":4,"nbits":8})";
+    knowhere::Json search = knowhere::Json::parse(R"({"metric_type":"L2","k":10,"nprobe":16})");
+
+    knowhere::fl::FlMemoryPool::Instance().Configure(0, 0);  // unlimited
+    auto idx_dev = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFPQ);
+    REQUIRE(idx_dev.Build(base, knowhere::Json::parse(build_json)) == knowhere::Status::success);
+    auto res_dev = idx_dev.Search(query, search);
+    REQUIRE(res_dev.has_value());
+
+    knowhere::fl::FlMemoryPool::Instance().Configure(0, 1);  // force OOM pre-check failure
+    auto idx_cpu = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFPQ);
+    REQUIRE(idx_cpu.Build(base, knowhere::Json::parse(build_json)) == knowhere::Status::success);
+    auto res_cpu = idx_cpu.Search(query, search);
+    REQUIRE(res_cpu.has_value());
+    knowhere::fl::FlMemoryPool::Instance().Configure(0, 0);
+
+    const int64_t* ids_dev = res_dev.value()->GetIds();
+    const int64_t* ids_cpu = res_cpu.value()->GetIds();
+    for (int64_t i = 0; i < kNq * kK; ++i) {
+        REQUIRE(ids_dev[i] == ids_cpu[i]);
+    }
+
+    // ADC is approximate: assert a conservative recall floor vs exact truth
+    // (recalibrate after the remote PPU run if needed)
+    auto truth = ExactKnn(static_cast<const float*>(base->GetTensor()), static_cast<const float*>(query->GetTensor()),
+                          kNb, kNq, kDim, kK, /*is_ip=*/false);
+    REQUIRE(RecallAtK(res_dev.value(), truth, kNq, kK) >= 0.4f);
+
+    knowhere::fl::UnregisterHostAdapter();
+}
+
+TEST_CASE("FL_IVF_PQ serialize/deserialize round trip", "[fl]") {
+    knowhere::fl::UnregisterHostAdapter();
+    auto base = GenDataSet(kNb, kDim, 42);
+    auto query = GenDataSet(kNq, kDim, 7);
+
+    auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_GPU_IVFPQ);  // user-facing name
+    knowhere::Json build = knowhere::Json::parse(R"({"metric_type":"L2","dim":16,"nlist":16,"m":4,"nbits":8})");
+    REQUIRE(idx.Build(base, build) == knowhere::Status::success);
+    REQUIRE(idx.Count() == kNb);
+
+    knowhere::BinarySet binset;
+    REQUIRE(idx.Serialize(binset) == knowhere::Status::success);
+
+    auto idx2 = CreateFlIndex(knowhere::IndexEnum::INDEX_GPU_IVFPQ);
+    knowhere::Json load_cfg = knowhere::Json::parse(R"({"metric_type":"L2","dim":16,"nlist":16,"m":4,"nbits":8})");
+    REQUIRE(idx2.Deserialize(binset, load_cfg) == knowhere::Status::success);
+    REQUIRE(idx2.Count() == kNb);
+
+    knowhere::Json search = knowhere::Json::parse(R"({"metric_type":"L2","k":10,"nprobe":16})");
+    auto res = idx.Search(query, search);
+    auto res2 = idx2.Search(query, search);
+    REQUIRE(res.has_value());
+    REQUIRE(res2.has_value());
+    // same data + deterministic train (fixed seed) -> identical results
+    const int64_t* ids = res.value()->GetIds();
+    const int64_t* ids2 = res2.value()->GetIds();
+    for (int64_t i = 0; i < kNq * kK; ++i) {
+        REQUIRE(ids[i] == ids2[i]);
+    }
+}
+
+TEST_CASE("FL_IVF_PQ rejects invalid train params", "[fl]") {
+    auto base = GenDataSet(kNb, kDim, 42);
+    auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFPQ);
+
+    // nbits != 8 not supported in v1
+    knowhere::Json bad_nbits = knowhere::Json::parse(R"({"metric_type":"L2","dim":16,"nlist":16,"m":4,"nbits":4})");
+    REQUIRE(idx.Build(base, bad_nbits) == knowhere::Status::invalid_args);
+
+    // dim % m != 0
+    knowhere::Json bad_m = knowhere::Json::parse(R"({"metric_type":"L2","dim":16,"nlist":16,"m":3,"nbits":8})");
+    REQUIRE(idx.Build(base, bad_m) == knowhere::Status::invalid_args);
+
+    // COSINE rejected per design D4
+    knowhere::Json cosine = knowhere::Json::parse(R"({"metric_type":"COSINE","dim":16,"nlist":16,"m":4,"nbits":8})");
+    REQUIRE(idx.Build(base, cosine) == knowhere::Status::invalid_metric_type);
+}
+
 #endif  // KNOWHERE_WITH_FL

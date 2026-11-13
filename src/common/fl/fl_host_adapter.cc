@@ -204,6 +204,67 @@ host_kmeans_assign(const void* xb, int64_t nb, int64_t dim, const void* centroid
     return 0;
 }
 
+// Reference semantics for the device ADC kernel:
+//   1) per-query LUT: lut[m][ks] = distance(q_sub_m, codebook[m][ks])
+//      (device side computes this via mm against reshaped codebooks)
+//   2) scan: dist(q, v) = sum_m lut[m][codes[v * m + m]]
+// L2 LUT stores squared sub-distances; IP LUT stores sub dot products and the
+// scan maximizes the sum.
+int
+host_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, const void* codes, int64_t /*nb*/,
+                 const void* xq, int64_t nq, int64_t /*dim*/, const int64_t* cand_ids, const int64_t* cand_offsets,
+                 int64_t k, int metric, float* out_dist, int64_t* out_ids, void* /*stream*/) {
+    if (codebooks == nullptr || codes == nullptr || xq == nullptr || cand_ids == nullptr || cand_offsets == nullptr ||
+        out_dist == nullptr || out_ids == nullptr || m <= 0 || ksub <= 0 || dsub <= 0) {
+        return -1;
+    }
+    const float* cb = static_cast<const float*>(codebooks);
+    const uint8_t* pq_codes = static_cast<const uint8_t*>(codes);
+    const float* queries = static_cast<const float*>(xq);
+
+#pragma omp parallel for schedule(dynamic)
+    for (int64_t i = 0; i < nq; ++i) {
+        const float* q = queries + i * m * dsub;
+        // 1) build LUT for this query
+        std::vector<float> lut(static_cast<size_t>(m) * ksub);
+        for (int64_t s = 0; s < m; ++s) {
+            const float* q_sub = q + s * dsub;
+            const float* cb_s = cb + s * ksub * dsub;
+            for (int64_t ks = 0; ks < ksub; ++ks) {
+                lut[static_cast<size_t>(s) * ksub + ks] = host_distance(q_sub, cb_s + ks * dsub, dsub, metric);
+            }
+        }
+        // 2) ADC scan over candidates
+        using Cand = std::pair<float, int64_t>;
+        const bool is_ip = (metric == 1);
+        std::vector<Cand> best;
+        best.reserve(static_cast<size_t>(k) + 1);
+        for (int64_t c = cand_offsets[i]; c < cand_offsets[i + 1]; ++c) {
+            const int64_t id = cand_ids[c];
+            const uint8_t* vc = pq_codes + static_cast<size_t>(id) * m;
+            float dist = 0.f;
+            for (int64_t s = 0; s < m; ++s) {
+                dist += lut[static_cast<size_t>(s) * ksub + vc[s]];
+            }
+            best.emplace_back(dist, id);
+        }
+        const int64_t nk = std::min<int64_t>(k, static_cast<int64_t>(best.size()));
+        std::partial_sort(best.begin(), best.begin() + nk, best.end(), [is_ip](const Cand& a, const Cand& b) {
+            return is_ip ? (a.first > b.first) : (a.first < b.first);
+        });
+        for (int64_t t = 0; t < k; ++t) {
+            if (t < nk) {
+                out_dist[i * k + t] = best[t].first;
+                out_ids[i * k + t] = best[t].second;
+            } else {
+                out_dist[i * k + t] = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+                out_ids[i * k + t] = -1;
+            }
+        }
+    }
+    return 0;
+}
+
 const FlDeviceOps g_host_ops = {
     host_device_count, host_set_device, host_device_sync,
     host_malloc,       host_free,       host_memcpy,
@@ -212,6 +273,7 @@ const FlDeviceOps g_host_ops = {
     host_brute_force_topk,
     host_ivf_flat_scan,
     host_kmeans_assign,
+    host_ivf_pq_scan,
 };
 
 }  // namespace

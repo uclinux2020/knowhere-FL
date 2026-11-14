@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Knowhere-FL contributors.
+// Copyright (C) 2026 knowhere-FL contributors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
@@ -41,7 +41,7 @@ namespace knowhere {
 
 // ---------------------------------------------------------------------------
 // FlBruteForceIndexNode (GPU_BRUTE_FORCE / FL_BRUTE_FORCE on the FL path).
-// One of Knowhere-FL's FL_* index nodes, built on the backend-neutral device
+// One of knowhere-FL's FL_* index nodes, built on the backend-neutral device
 // abstraction layer that accelerates vector search on diverse AI chips.
 //
 // Search strategy (design D5):

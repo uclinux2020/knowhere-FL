@@ -29,7 +29,7 @@ knowhere_option(WITH_GPU "Build with GPU support (cuVS or Cardinal)" OFF)
 knowhere_option(WITH_CUVS "Build with CUVS indexes" OFF)
 # FL (FlagOS) backend: domestic-GPU acceleration path based on the FlagOS
 # operator ecosystem (FlagGems / FlagTree). Mutually exclusive with the
-# CUDA/cuVS path (D2 in the Knowhere-FL design doc).
+# CUDA/cuVS path (D2 in the knowhere-FL design doc).
 knowhere_option(WITH_FL "Build with FlagOS FL (domestic GPU) support" OFF)
 knowhere_option(WITH_FL_PPU "Build the FL PPU (Zhenwu/ZW810E) chip adapter; requires PPU_SDK_PATH" OFF)
 if(WITH_FL_PPU AND NOT WITH_FL)

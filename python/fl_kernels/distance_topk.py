@@ -1,4 +1,4 @@
-# Copyright (C) 2026 Knowhere-FL contributors.
+# Copyright (C) 2026 knowhere-FL contributors.
 # Licensed under the Apache License, Version 2.0.
 #
 # Phase 0 micro-benchmark: FL brute-force distance + top-k composed purely

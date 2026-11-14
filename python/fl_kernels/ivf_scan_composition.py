@@ -1,4 +1,4 @@
-# Copyright (C) 2026 Knowhere-FL contributors.
+# Copyright (C) 2026 knowhere-FL contributors.
 # Licensed under the Apache License, Version 2.0.
 #
 # Phase 1.3/P2 micro-benchmark: IVF candidate scan composed purely from

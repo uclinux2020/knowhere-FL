@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Knowhere-FL contributors.
+// Copyright (C) 2026 knowhere-FL contributors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
@@ -21,11 +21,11 @@ namespace knowhere {
 namespace fl {
 
 // ---------------------------------------------------------------------------
-// Knowhere-FL: a fork of Knowhere that accelerates vector search on diverse
+// knowhere-FL: a fork of Knowhere that accelerates vector search on diverse
 // AI chips through a backend-neutral device abstraction layer, built on top
 // of FlagOS (a unified open-source AI system software stack).
 //
-// This file is the heart of that abstraction. Knowhere-FL never calls a chip
+// This file is the heart of that abstraction. knowhere-FL never calls a chip
 // runtime directly. All device interaction goes through FlDeviceOps, a C-ABI
 // function table implemented by a per-chip adapter (e.g. the PPU adapter that
 // wraps the validated FlagFit launch path: HIDDEN_PARAM / hgLaunchKernelEx /

@@ -1,6 +1,6 @@
-# Knowhere-FL
+# knowhere-FL
 
-**Knowhere-FL is a fork of [Knowhere](https://github.com/zilliztech/knowhere) that introduces a backend-neutral device abstraction layer (FL) for accelerating vector search on diverse AI chips, built on top of [FlagOS](https://github.com/flagos-ai), a unified open-source AI system software stack.**
+**knowhere-FL is a fork of [Knowhere](https://github.com/zilliztech/knowhere) that introduces a backend-neutral device abstraction layer (FL) for accelerating vector search on diverse AI chips, built on top of [FlagOS](https://github.com/flagos-ai), a unified open-source AI system software stack.**
 
 基于 [zilliztech/knowhere](https://github.com/zilliztech/knowhere) 的 fork，新增后端中立的 **FL（FlagOS）设备抽象层**与 4 个 FL_* 索引节点，用于在国产 GPU / PPU 上加速 Milvus 向量检索。
 
@@ -11,7 +11,7 @@
 
 ## 架构总览
 
-Knowhere-FL 沿用 FlagOS 生态 fork 项目的插件化叙事（参照 [Megatron-LM-FL](https://github.com/flagos-ai/Megatron-LM-FL) 的 `plugin/<vendor>/` 设计）：**上游 Knowhere 的检索接口与索引名不变**，只通过一个后端中立的设备抽象层接入多元 AI 芯片。
+knowhere-FL 沿用 FlagOS 生态 fork 项目的插件化叙事（参照 [Megatron-LM-FL](https://github.com/flagos-ai/Megatron-LM-FL) 的 `plugin/<vendor>/` 设计）：**上游 Knowhere 的检索接口与索引名不变**，只通过一个后端中立的设备抽象层接入多元 AI 芯片。
 
 | 层 | 位置 | 说明 |
 |---|---|---|
@@ -26,7 +26,7 @@ Knowhere-FL 沿用 FlagOS 生态 fork 项目的插件化叙事（参照 [Megatro
 
 ---
 
-# Knowhere-FL 实施工作区与 Milvus 集成指南
+# knowhere-FL 实施工作区与 Milvus 集成指南
 
 > 对应方案文档：《基于FlagOS的Milvus国产GPU加速技术方案.md》v2.1
 > 基线：zilliztech/knowhere @ 68b6319（2026-11-13 浅克隆）

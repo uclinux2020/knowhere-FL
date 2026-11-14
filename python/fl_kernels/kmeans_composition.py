@@ -1,4 +1,4 @@
-# Copyright (C) 2026 Knowhere-FL contributors.
+# Copyright (C) 2026 knowhere-FL contributors.
 # Licensed under the Apache License, Version 2.0.
 #
 # Phase 1.2 micro-benchmark: full Lloyd kmeans composed purely from FlagOS

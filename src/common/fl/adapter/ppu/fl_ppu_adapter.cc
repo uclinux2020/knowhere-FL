@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Knowhere-FL contributors.
+// Copyright (C) 2026 knowhere-FL contributors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
@@ -11,7 +11,7 @@
 
 // ---------------------------------------------------------------------------
 // PPU adapter (Zhenwu/ZW810E): one of the per-chip adapters that plug diverse
-// AI chips into Knowhere-FL's backend-neutral device abstraction layer. It
+// AI chips into knowhere-FL's backend-neutral device abstraction layer. It
 // implements FlDeviceOps on top of the PPU runtime, reusing the launch path
 // validated in the FlagFit project (HIDDEN_PARAM ABI fix / hgLaunchKernelEx /
 // HGlaunchConfig / device context binding - the BUG-H resolution chain).

@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Knowhere-FL contributors.
+// Copyright (C) 2026 knowhere-FL contributors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
@@ -44,7 +44,7 @@ namespace knowhere {
 
 // ---------------------------------------------------------------------------
 // FlIvfFlatIndexNode (GPU_IVF_FLAT / FL_IVF_FLAT on the FL path).
-// One of Knowhere-FL's FL_* index nodes, built on the backend-neutral device
+// One of knowhere-FL's FL_* index nodes, built on the backend-neutral device
 // abstraction layer that accelerates vector search on diverse AI chips.
 //
 // v1 design (per plan, Phase 1.2/1.3 with the documented fallback):

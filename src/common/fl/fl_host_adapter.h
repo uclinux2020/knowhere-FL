@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Knowhere-FL contributors.
+// Copyright (C) 2026 knowhere-FL contributors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
@@ -17,7 +17,7 @@ namespace fl {
 
 // Host adapter: the CPU reference implementation of FlDeviceOps, one of the
 // per-chip adapters (src/common/fl/adapter/) that plug diverse AI chips into
-// Knowhere-FL without touching upstream Knowhere. "Device" buffers are plain
+// knowhere-FL without touching upstream Knowhere. "Device" buffers are plain
 // host allocations and kernels run on CPU (OpenMP). Purposes:
 //   1. Unit tests exercise the full FL device path without a GPU;
 //   2. CPU-only CI validates adapter/node contract end to end;

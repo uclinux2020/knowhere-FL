@@ -135,6 +135,13 @@ class FlBruteForceIndexNode : public IndexNode {
         if (status != Status::success) {
             return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
         }
+        // MapOutToIn passes caller ids through unchanged when the node has no
+        // id map, so a caller-supplied id may exceed nb_ (no payload). Drop
+        // out-of-range ids instead of reading out of bounds (upstream IVF
+        // relies on faiss reconstruct's bounds check for the same reason).
+        in_ids.erase(std::remove_if(in_ids.begin(), in_ids.end(),
+                                    [this](int64_t id) { return id < 0 || id >= nb_; }),
+                     in_ids.end());
         const int64_t rows = static_cast<int64_t>(in_ids.size());
         if (rows == 0) {
             return GenResultDataSet(0, dim_, nullptr);

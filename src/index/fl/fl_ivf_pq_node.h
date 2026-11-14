@@ -19,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <queue>
 #include <string>
 #include <utility>
 #include <vector>
@@ -351,7 +352,8 @@ class FlIvfPqIndexNode : public IndexNode {
     StaticEstimateLoadResource(const uint64_t file_size_in_bytes, const int64_t num_rows, const int64_t dim,
                                const knowhere::BaseConfig& config, const IndexVersion& /*version*/) {
         Resource res;
-        int64_t m = dim > 0 ? dim / 2 : 1;  // FlIvfPqConfig default
+        int64_t m = 8;  // FlIvfPqConfig default m (unreachable fallback: the
+                        // framework always passes a FlIvfPqConfig here)
         if (const auto* pq_cfg = dynamic_cast<const FlIvfPqConfig*>(&config)) {
             m = pq_cfg->m.value();
         }
@@ -517,9 +519,13 @@ class FlIvfPqIndexNode : public IndexNode {
                     lut[static_cast<size_t>(s) * ksub_ + ks] = is_ip ? dot : (na + nc - 2.f * dot);
                 }
             }
+            // bounded max-heap over the ADC distances (O(k) memory; same
+            // selection pattern as the host adapter's host_ivf_pq_scan).
             using Cand = std::pair<float, int64_t>;
-            std::vector<Cand> best;
-            best.reserve(static_cast<size_t>(k) + 1);
+            auto cmp = [is_ip](const Cand& a, const Cand& b) {
+                return is_ip ? (a.first > b.first) : (a.first < b.first);
+            };
+            std::priority_queue<Cand, std::vector<Cand>, decltype(cmp)> heap(cmp);
             for (int64_t c = cand_offsets[i]; c < cand_offsets[i + 1]; ++c) {
                 const int64_t id = cand_ids[c];
                 const uint8_t* vc = codes_.data() + static_cast<size_t>(id) * m_;
@@ -527,20 +533,25 @@ class FlIvfPqIndexNode : public IndexNode {
                 for (int64_t s = 0; s < m_; ++s) {
                     dist += lut[static_cast<size_t>(s) * ksub_ + vc[s]];
                 }
-                best.emplace_back(dist, id);
-            }
-            const int64_t nk = std::min<int64_t>(k, static_cast<int64_t>(best.size()));
-            std::partial_sort(best.begin(), best.begin() + nk, best.end(), [is_ip](const Cand& a, const Cand& b) {
-                return is_ip ? (a.first > b.first) : (a.first < b.first);
-            });
-            for (int64_t t = 0; t < k; ++t) {
-                if (t < nk) {
-                    distances[i * k + t] = best[t].first;
-                    ids[i * k + t] = best[t].second;
+                if (static_cast<int64_t>(heap.size()) < k) {
+                    heap.emplace(dist, id);
                 } else {
+                    const float worst = heap.top().first;
+                    if ((is_ip && dist > worst) || (!is_ip && dist < worst)) {
+                        heap.pop();
+                        heap.emplace(dist, id);
+                    }
+                }
+            }
+            for (int64_t t = k - 1; t >= 0; --t) {
+                if (heap.empty()) {
                     distances[i * k + t] =
                         is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
                     ids[i * k + t] = -1;
+                } else {
+                    distances[i * k + t] = heap.top().first;
+                    ids[i * k + t] = heap.top().second;
+                    heap.pop();
                 }
             }
         }

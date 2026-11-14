@@ -199,12 +199,17 @@ class FlCagraIndexNode : public IndexNode {
         if (status != Status::success) {
             return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
         }
+        // MapOutToIn passes caller ids through unchanged when the node has no
+        // id map, so a caller-supplied id may exceed nb_ (no payload). Drop
+        // out-of-range ids instead of reading out of bounds (upstream IVF
+        // relies on faiss reconstruct's bounds check for the same reason).
+        in_ids.erase(std::remove_if(in_ids.begin(), in_ids.end(),
+                                    [this](int64_t id) { return id < 0 || id >= nb_; }),
+                     in_ids.end());
         const int64_t rows = static_cast<int64_t>(in_ids.size());
         if (rows == 0) {
             return GenResultDataSet(0, dim_, nullptr);
         }
-        // GenResultDataSet takes ownership of the heap buffer (IsOwner=true),
-        // same idiom as the other FL nodes.
         auto* data = new (std::nothrow) float[static_cast<size_t>(rows) * dim_];
         if (data == nullptr) {
             return expected<DataSetPtr>::Err(Status::malloc_error, "GetVectorByIds alloc failed");
@@ -243,11 +248,9 @@ class FlCagraIndexNode : public IndexNode {
             writer(host_xb_.data(), sizeof(float), host_xb_.size());
             writer(graph_ids_.data(), sizeof(int64_t), graph_ids_.size());
             writer(graph_offsets_.data(), sizeof(int64_t), graph_offsets_.size());
-            std::shared_ptr<uint8_t[]> data(new (std::nothrow) uint8_t[writer.tellg()]);
-            if (data == nullptr) {
-                return Status::malloc_error;
-            }
-            std::memcpy(data.get(), writer.data(), writer.tellg());
+            // Adopt the writer's buffer (it is new[]-allocated and has no
+            // destructor); copying it would leak writer.data_ on every call.
+            std::shared_ptr<uint8_t[]> data(writer.data());
             binset.Append(Type(), data, writer.tellg());
             return Status::success;
         } catch (const std::exception& e) {

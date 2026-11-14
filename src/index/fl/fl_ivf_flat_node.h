@@ -19,6 +19,7 @@
 #include <memory>
 #include <new>
 #include <numeric>
+#include <queue>
 #include <random>
 #include <string>
 #include <utility>
@@ -185,6 +186,13 @@ class FlIvfFlatIndexNode : public IndexNode {
         if (status != Status::success) {
             return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
         }
+        // MapOutToIn passes caller ids through unchanged when the node has no
+        // id map, so a caller-supplied id may exceed nb_ (no payload). Drop
+        // out-of-range ids instead of reading out of bounds (upstream IVF
+        // relies on faiss reconstruct's bounds check for the same reason).
+        in_ids.erase(std::remove_if(in_ids.begin(), in_ids.end(),
+                                    [this](int64_t id) { return id < 0 || id >= nb_; }),
+                     in_ids.end());
         const int64_t rows = static_cast<int64_t>(in_ids.size());
         if (rows == 0) {
             return GenResultDataSet(0, dim_, nullptr);
@@ -595,9 +603,14 @@ class FlIvfFlatIndexNode : public IndexNode {
         const bool is_ip = metric_code_ == 1;
 #pragma omp parallel for schedule(dynamic)
         for (int64_t i = 0; i < nq; ++i) {
+            // bounded max-heap of (dist, id); for L2 keep smallest, for IP keep
+            // largest (same selection pattern as the host adapter). O(k) memory
+            // instead of collecting every candidate then partial_sort.
             using Cand = std::pair<float, int64_t>;
-            std::vector<Cand> best;
-            best.reserve(static_cast<size_t>(k) + 1);
+            auto cmp = [is_ip](const Cand& a, const Cand& b) {
+                return is_ip ? (a.first > b.first) : (a.first < b.first);
+            };
+            std::priority_queue<Cand, std::vector<Cand>, decltype(cmp)> heap(cmp);
             const float* q = xq + i * dim_;
             // query norm is loop-invariant; compute once per query
             float na = 0.f;
@@ -617,20 +630,25 @@ class FlIvfFlatIndexNode : public IndexNode {
                     }
                 }
                 const float dist = is_ip ? dot : (na + nbsum - 2.f * dot);
-                best.emplace_back(dist, id);
-            }
-            const int64_t nk = std::min<int64_t>(k, best.size());
-            std::partial_sort(best.begin(), best.begin() + nk, best.end(), [is_ip](const Cand& a, const Cand& b) {
-                return is_ip ? (a.first > b.first) : (a.first < b.first);
-            });
-            for (int64_t t = 0; t < k; ++t) {
-                if (t < nk) {
-                    distances[i * k + t] = best[t].first;
-                    ids[i * k + t] = best[t].second;
+                if (static_cast<int64_t>(heap.size()) < k) {
+                    heap.emplace(dist, id);
                 } else {
+                    const float worst = heap.top().first;
+                    if ((is_ip && dist > worst) || (!is_ip && dist < worst)) {
+                        heap.pop();
+                        heap.emplace(dist, id);
+                    }
+                }
+            }
+            for (int64_t t = k - 1; t >= 0; --t) {
+                if (heap.empty()) {
                     distances[i * k + t] =
                         is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
                     ids[i * k + t] = -1;
+                } else {
+                    distances[i * k + t] = heap.top().first;
+                    ids[i * k + t] = heap.top().second;
+                    heap.pop();
                 }
             }
         }

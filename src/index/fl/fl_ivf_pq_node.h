@@ -135,10 +135,10 @@ class FlIvfPqIndexNode : public IndexNode {
         // offset). Coarse norms come from the Train-time cache; codebook
         // norms are computed once per Add instead of nb*m times inside
         // NearestIn.
-        std::vector<float> cb_norms;
-        if (metric_code_ == 0) {
-            cb_norms = ComputeNorms(codebooks_.data(), m_ * ksub_, dsub_);
-        }
+        // Codebook sub-vector norms are cached as a member: recomputed on Add /
+        // Deserialize and reused by the per-query LUT build in CpuAdcScan (the
+        // node is L2-only, so cb_norms_ is always populated).
+        cb_norms_ = ComputeNorms(codebooks_.data(), m_ * ksub_, dsub_);
         const float* cent_norms = cent_norms_.data();  // empty for IP (unused)
 #pragma omp parallel for schedule(dynamic)
         for (int64_t j = 0; j < nb_; ++j) {
@@ -147,7 +147,7 @@ class FlIvfPqIndexNode : public IndexNode {
             // per-subspace encoding
             for (int64_t s = 0; s < m_; ++s) {
                 codes_[static_cast<size_t>(j) * m_ + s] = static_cast<uint8_t>(NearestIn(
-                    v + s * dsub_, codebooks_.data() + s * ksub_ * dsub_, cb_norms.data() + s * ksub_, ksub_, dsub_));
+                    v + s * dsub_, codebooks_.data() + s * ksub_ * dsub_, cb_norms_.data() + s * ksub_, ksub_, dsub_));
             }
         }
         for (int64_t j = 0; j < nb_; ++j) {
@@ -327,6 +327,7 @@ class FlIvfPqIndexNode : public IndexNode {
             }
         }
         RefreshCentroidNorms();
+        cb_norms_ = ComputeNorms(codebooks_.data(), m_ * ksub_, dsub_);
         TryStageToDevice();
         return Status::success;
     }
@@ -509,14 +510,15 @@ class FlIvfPqIndexNode : public IndexNode {
                 }
                 for (int64_t ks = 0; ks < ksub_; ++ks) {
                     const float* c = cb_s + ks * dsub_;
-                    float dot = 0.f, nc = 0.f;
+                    float dot = 0.f;
                     for (int64_t d = 0; d < dsub_; ++d) {
                         dot += q_sub[d] * c[d];
-                        if (!is_ip) {
-                            nc += c[d] * c[d];
-                        }
                     }
-                    lut[static_cast<size_t>(s) * ksub_ + ks] = is_ip ? dot : (na + nc - 2.f * dot);
+                    // codebook sub-vector norm comes from the cached cb_norms_
+                    // (recomputed only on Add/Deserialize); query sub-vector
+                    // norm (na) is loop-invariant per subspace.
+                    lut[static_cast<size_t>(s) * ksub_ + ks] =
+                        is_ip ? dot : (na + cb_norms_[static_cast<size_t>(s) * ksub_ + ks] - 2.f * dot);
                 }
             }
             // bounded max-heap over the ADC distances (O(k) memory; same
@@ -611,6 +613,7 @@ class FlIvfPqIndexNode : public IndexNode {
     std::vector<float> centroids_;    // nlist * dim (coarse)
     std::vector<float> cent_norms_;   // cached ||c_l||^2 of coarse centroids (L2 only)
     std::vector<float> codebooks_;    // m * ksub * dsub
+    std::vector<float> cb_norms_;     // cached ||c||^2 of codebook sub-vectors (m * ksub, L2 only)
     std::vector<uint8_t> codes_;      // nb * m
     std::vector<std::vector<int64_t>> invlists_;
     fl::FlDeviceBuffer dev_codebooks_;

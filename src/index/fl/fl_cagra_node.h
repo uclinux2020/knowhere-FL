@@ -200,12 +200,11 @@ class FlCagraIndexNode : public IndexNode {
             return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
         }
         // MapOutToIn passes caller ids through unchanged when the node has no
-        // id map, so a caller-supplied id may exceed nb_ (no payload). Drop
-        // out-of-range ids instead of reading out of bounds (upstream IVF
-        // relies on faiss reconstruct's bounds check for the same reason).
-        in_ids.erase(std::remove_if(in_ids.begin(), in_ids.end(),
-                                    [this](int64_t id) { return id < 0 || id >= nb_; }),
-                     in_ids.end());
+        // id map, so a caller-supplied id may exceed nb_ (no payload). Keep
+        // the result shape aligned with the request (upstream IVF returns one
+        // row per requested id and relies on faiss reconstruct's assert for
+        // the bounds); emit a zero vector for out-of-range ids instead of
+        // reading out of bounds.
         const int64_t rows = static_cast<int64_t>(in_ids.size());
         if (rows == 0) {
             return GenResultDataSet(0, dim_, nullptr);
@@ -215,7 +214,12 @@ class FlCagraIndexNode : public IndexNode {
             return expected<DataSetPtr>::Err(Status::malloc_error, "GetVectorByIds alloc failed");
         }
         for (int64_t i = 0; i < rows; ++i) {
-            std::memcpy(data + i * dim_, host_xb_.data() + in_ids[i] * dim_, dim_ * sizeof(float));
+            const int64_t id = in_ids[i];
+            if (id < 0 || id >= nb_) {
+                std::memset(data + i * dim_, 0, static_cast<size_t>(dim_) * sizeof(float));
+            } else {
+                std::memcpy(data + i * dim_, host_xb_.data() + id * dim_, dim_ * sizeof(float));
+            }
         }
         return GenResultDataSet(rows, dim_, data);
     }

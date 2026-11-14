@@ -38,7 +38,7 @@
 // The wrapper owns: device context binding, HGlaunchConfig construction,
 // HIDDEN_PARAM injection, hgLaunchKernelEx invocation.
 // TODO(PPU): replace these forward decls with the real FlagFit headers when
-// integrating on the PPU dev box (bastion.aiops.baai.ac.cn environment).
+// integrating on the PPU dev box.
 extern "C" {
 int hgDeviceCount();
 int hgSetDevice(int device_id);

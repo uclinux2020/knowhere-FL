@@ -9,8 +9,8 @@
 // distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
-#ifndef FL_GRAPH_SEARCH_CPU_H
-#define FL_GRAPH_SEARCH_CPU_H
+#ifndef KNOWHERE_FL_GRAPH_SEARCH_CPU_H
+#define KNOWHERE_FL_GRAPH_SEARCH_CPU_H
 
 #include <algorithm>
 #include <cstdint>
@@ -62,6 +62,13 @@ FlGraphSearchCpu(const float* xb, int64_t nb, int64_t dim, const int64_t* graph_
 
 #pragma omp parallel for schedule(dynamic)
     for (int64_t i = 0; i < nq; ++i) {
+        if (nb <= 0) {  // empty graph: pad the whole row
+            for (int64_t t = 0; t < k; ++t) {
+                out_dist[i * k + t] = kWorst;
+                out_ids[i * k + t] = -1;
+            }
+            continue;
+        }
         const float* q = xq + i * dim;
         struct Cand {
             float dist;
@@ -72,7 +79,14 @@ FlGraphSearchCpu(const float* xb, int64_t nb, int64_t dim, const int64_t* graph_
         frontier.reserve(static_cast<size_t>(frontier_cap) + max_degree);
         std::vector<char> visited(static_cast<size_t>(nb), 0);
 
-        auto better = [is_ip](float a, float b) { return is_ip ? (a > b) : (a < b); };
+        auto better = [is_ip](const Cand& a, const Cand& b) {
+            // deterministic tie-break on id so results are reproducible
+            // (std::sort is not stable)
+            if (a.dist != b.dist) {
+                return is_ip ? (a.dist > b.dist) : (a.dist < b.dist);
+            }
+            return a.id < b.id;
+        };
         auto try_push = [&](int64_t id, float dist) {
             if (visited[id]) {
                 return;
@@ -91,7 +105,7 @@ FlGraphSearchCpu(const float* xb, int64_t nb, int64_t dim, const int64_t* graph_
                 if (frontier[t].expanded) {
                     continue;
                 }
-                if (best_idx < 0 || better(frontier[t].dist, frontier[best_idx].dist)) {
+                if (best_idx < 0 || better(frontier[t], frontier[static_cast<size_t>(best_idx)])) {
                     best_idx = static_cast<int64_t>(t);
                 }
             }
@@ -110,15 +124,14 @@ FlGraphSearchCpu(const float* xb, int64_t nb, int64_t dim, const int64_t* graph_
                 try_push(nid, FlGraphDistance(q, xb + nid * dim, dim, metric));
             }
             if (static_cast<int64_t>(frontier.size()) > frontier_cap * 2) {
-                std::sort(frontier.begin(), frontier.end(),
-                          [&](const Cand& a, const Cand& b) { return better(a.dist, b.dist); });
+                std::sort(frontier.begin(), frontier.end(), better);
                 // dropped tail stays visited=1 -> effectively pruned; this is
                 // the intended bounded-memory behavior (CAGRA prunes too)
                 frontier.resize(static_cast<size_t>(frontier_cap));
             }
         }
 
-        std::sort(frontier.begin(), frontier.end(), [&](const Cand& a, const Cand& b) { return better(a.dist, b.dist); });
+        std::sort(frontier.begin(), frontier.end(), better);
         for (int64_t t = 0; t < k; ++t) {
             if (t < static_cast<int64_t>(frontier.size())) {
                 out_dist[i * k + t] = frontier[static_cast<size_t>(t)].dist;
@@ -134,4 +147,4 @@ FlGraphSearchCpu(const float* xb, int64_t nb, int64_t dim, const int64_t* graph_
 }  // namespace fl
 }  // namespace knowhere
 
-#endif  // FL_GRAPH_SEARCH_CPU_H
+#endif  // KNOWHERE_FL_GRAPH_SEARCH_CPU_H

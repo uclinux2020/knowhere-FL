@@ -9,8 +9,8 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
-#ifndef FL_DEVICE_ROUTER_H
-#define FL_DEVICE_ROUTER_H
+#ifndef KNOWHERE_FL_DEVICE_ROUTER_H
+#define KNOWHERE_FL_DEVICE_ROUTER_H
 
 #include <atomic>
 #include <cstdint>
@@ -70,4 +70,4 @@ class FlDeviceRouter {
 }  // namespace fl
 }  // namespace knowhere
 
-#endif  // FL_DEVICE_ROUTER_H
+#endif  // KNOWHERE_FL_DEVICE_ROUTER_H

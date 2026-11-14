@@ -20,7 +20,7 @@
 // launches them through the FlagFit launch wrapper.
 //
 // This file only compiles when the PPU SDK is available:
-//   cmake .. -DWITH_FL=ON -DKNOWHERE_FL_WITH_PPU=ON -DPPU_SDK_ROOT=/opt/ppu
+//   cmake .. -DWITH_FL=ON -DWITH_FL_PPU=ON -DPPU_SDK_PATH=/opt/ppu
 // Without the SDK the file compiles to an empty TU so the rest of the FL
 // backend stays buildable everywhere.
 // ---------------------------------------------------------------------------

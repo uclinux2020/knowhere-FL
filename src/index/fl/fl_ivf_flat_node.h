@@ -9,8 +9,8 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
-#ifndef FL_IVF_FLAT_NODE_H
-#define FL_IVF_FLAT_NODE_H
+#ifndef KNOWHERE_FL_IVF_FLAT_NODE_H
+#define KNOWHERE_FL_IVF_FLAT_NODE_H
 
 #include <algorithm>
 #include <cmath>
@@ -249,23 +249,40 @@ class FlIvfFlatIndexNode : public IndexNode {
         if (!fl::ReadFormatHeader(reader, "IVF_FLAT")) {
             return Status::invalid_binary_set;
         }
-        reader(&dim_, sizeof(dim_), 1);
-        reader(&nb_, sizeof(nb_), 1);
-        reader(&nlist_, sizeof(nlist_), 1);
-        reader(&metric_code_, sizeof(metric_code_), 1);
+        if (!fl::ReadChecked(reader, &dim_, sizeof(dim_), 1) || !fl::ReadChecked(reader, &nb_, sizeof(nb_), 1) ||
+            !fl::ReadChecked(reader, &nlist_, sizeof(nlist_), 1) ||
+            !fl::ReadChecked(reader, &metric_code_, sizeof(metric_code_), 1) ||
+            !fl::FlScalarDimsSane(dim_, nb_) || nlist_ <= 0 || nlist_ > nb_ ||
+            (metric_code_ != 0 && metric_code_ != 1)) {
+            LOG_KNOWHERE_WARNING_ << "FL IVF_FLAT deserialize: corrupt header";
+            return Status::invalid_binary_set;
+        }
         centroids_.resize(static_cast<size_t>(nlist_) * dim_);
-        reader(centroids_.data(), sizeof(float), centroids_.size());
         host_xb_.resize(static_cast<size_t>(nb_) * dim_);
-        reader(host_xb_.data(), sizeof(float), host_xb_.size());
+        if (!fl::ReadChecked(reader, centroids_.data(), sizeof(float), centroids_.size()) ||
+            !fl::ReadChecked(reader, host_xb_.data(), sizeof(float), host_xb_.size())) {
+            LOG_KNOWHERE_WARNING_ << "FL IVF_FLAT deserialize: truncated payload";
+            return Status::invalid_binary_set;
+        }
         invlists_.assign(nlist_, {});
         assign_.resize(nb_);
         for (int64_t l = 0; l < nlist_; ++l) {
             int64_t sz = 0;
-            reader(&sz, sizeof(sz), 1);
-            invlists_[l].resize(sz);
+            if (!fl::ReadChecked(reader, &sz, sizeof(sz), 1) || sz < 0 || sz > nb_) {
+                LOG_KNOWHERE_WARNING_ << "FL IVF_FLAT deserialize: corrupt inverted list header";
+                return Status::invalid_binary_set;
+            }
+            invlists_[l].resize(static_cast<size_t>(sz));
             if (sz > 0) {
-                reader(invlists_[l].data(), sizeof(int64_t), sz);
+                if (!fl::ReadChecked(reader, invlists_[l].data(), sizeof(int64_t), static_cast<size_t>(sz))) {
+                    LOG_KNOWHERE_WARNING_ << "FL IVF_FLAT deserialize: truncated inverted list";
+                    return Status::invalid_binary_set;
+                }
                 for (auto id : invlists_[l]) {
+                    if (id < 0 || id >= nb_) {
+                        LOG_KNOWHERE_WARNING_ << "FL IVF_FLAT deserialize: member id out of range";
+                        return Status::invalid_binary_set;
+                    }
                     assign_[id] = l;
                 }
             }
@@ -360,12 +377,11 @@ class FlIvfFlatIndexNode : public IndexNode {
             if (ops->kmeans_assign != nullptr && ops->malloc != nullptr && ops->free != nullptr &&
                 ops->memcpy_h2d != nullptr && ops->set_device != nullptr &&
                 ops->set_device(fl::FlDeviceRouter::Instance().Acquire()) == 0 &&
-                fl::FlMemoryPool::Instance().Ensure(x_bytes + c_bytes)) {
+                fl::FlMemoryPool::Instance().TryReserve(x_bytes + c_bytes)) {
                 d_x = ops->malloc(x_bytes);
                 d_c = ops->malloc(c_bytes);
                 if (d_x != nullptr && d_c != nullptr && ops->memcpy_h2d(d_x, x, x_bytes, nullptr) == 0) {
-                    staged_bytes = x_bytes + c_bytes;
-                    fl::FlMemoryPool::Instance().TrackAlloc(staged_bytes);
+                    staged_bytes = x_bytes + c_bytes;  // reservation held; released by TrackFree below
                     LOG_KNOWHERE_INFO_ << "FL IVF_FLAT kmeans: device assignment enabled";
                 } else {
                     if (d_x != nullptr) {
@@ -374,6 +390,7 @@ class FlIvfFlatIndexNode : public IndexNode {
                     if (d_c != nullptr) {
                         ops->free(d_c);
                     }
+                    fl::FlMemoryPool::Instance().TrackFree(x_bytes + c_bytes);  // release reservation
                     d_x = d_c = nullptr;
                 }
             }
@@ -456,25 +473,20 @@ class FlIvfFlatIndexNode : public IndexNode {
             if (ops->kmeans_assign != nullptr && ops->malloc != nullptr && ops->free != nullptr &&
                 ops->memcpy_h2d != nullptr && ops->set_device != nullptr &&
                 ops->set_device(fl::FlDeviceRouter::Instance().Acquire()) == 0 &&
-                fl::FlMemoryPool::Instance().Ensure(x_bytes + c_bytes)) {
+                fl::FlMemoryPool::Instance().TryReserve(x_bytes + c_bytes)) {
                 void* d_x = ops->malloc(x_bytes);
                 void* d_c = ops->malloc(c_bytes);
-                const bool alloc_ok = d_x != nullptr && d_c != nullptr;
-                if (alloc_ok) {
-                    fl::FlMemoryPool::Instance().TrackAlloc(x_bytes + c_bytes);
-                }
-                bool ok = alloc_ok && ops->memcpy_h2d(d_x, x, x_bytes, nullptr) == 0 &&
-                          ops->memcpy_h2d(d_c, centroids_.data(), c_bytes, nullptr) == 0 &&
-                          ops->kmeans_assign(d_x, nb, dim_, d_c, nlist_, metric_code_, out, nullptr) == 0;
+                const bool ok = d_x != nullptr && d_c != nullptr &&
+                                ops->memcpy_h2d(d_x, x, x_bytes, nullptr) == 0 &&
+                                ops->memcpy_h2d(d_c, centroids_.data(), c_bytes, nullptr) == 0 &&
+                                ops->kmeans_assign(d_x, nb, dim_, d_c, nlist_, metric_code_, out, nullptr) == 0;
                 if (d_x != nullptr) {
                     ops->free(d_x);
                 }
                 if (d_c != nullptr) {
                     ops->free(d_c);
                 }
-                if (alloc_ok) {
-                    fl::FlMemoryPool::Instance().TrackFree(x_bytes + c_bytes);
-                }
+                fl::FlMemoryPool::Instance().TrackFree(x_bytes + c_bytes);  // release reservation
                 if (ok) {
                     return;
                 }
@@ -632,27 +644,30 @@ class FlIvfFlatIndexNode : public IndexNode {
         }
         const fl::FlDeviceOps* ops = fl::GetDeviceOps();
         const size_t bytes = host_xb_.size() * sizeof(float);
-        if (!fl::FlMemoryPool::Instance().Ensure(bytes)) {
+        if (!fl::FlMemoryPool::Instance().TryReserve(bytes)) {
             LOG_KNOWHERE_WARNING_ << "FL memory pool rejects staging " << bytes << " bytes; IVF_FLAT on CPU fallback";
             return;
         }
         if (ops->set_device == nullptr || ops->malloc == nullptr || ops->memcpy_h2d == nullptr) {
+            fl::FlMemoryPool::Instance().TrackFree(bytes);
             return;
         }
         device_id_ = fl::FlDeviceRouter::Instance().Acquire();
         if (ops->set_device(device_id_) != 0) {
+            fl::FlMemoryPool::Instance().TrackFree(bytes);
             return;
         }
         void* d = ops->malloc(bytes);
         if (d == nullptr) {
+            fl::FlMemoryPool::Instance().TrackFree(bytes);
             return;
         }
         if (ops->memcpy_h2d(d, host_xb_.data(), bytes, nullptr) != 0) {
             ops->free(d);
+            fl::FlMemoryPool::Instance().TrackFree(bytes);
             return;
         }
         dev_xb_ = fl::FlDeviceBuffer(d, bytes);
-        fl::FlMemoryPool::Instance().TrackAlloc(bytes);
         dev_ready_ = true;
         LOG_KNOWHERE_INFO_ << "FL IVF_FLAT staged " << nb_ << " x " << dim_ << " vectors on device";
     }
@@ -674,4 +689,4 @@ class FlIvfFlatIndexNode : public IndexNode {
 
 }  // namespace knowhere
 
-#endif  // FL_IVF_FLAT_NODE_H
+#endif  // KNOWHERE_FL_IVF_FLAT_NODE_H

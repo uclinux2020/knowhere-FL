@@ -155,6 +155,10 @@ StatusCategoryOf(knowhere::Status status) {
         case knowhere::Status::emb_list_inner_error:
         case knowhere::Status::aisaq_error:
         case knowhere::Status::knowhere_inner_error:
+        // FL device/runtime failures are permanent for the current process
+        // state (adapter/kernel broken); retrying cannot fix them, and they
+        // are never the caller's fault, so not input_error either.
+        case knowhere::Status::fl_device_error:
             return StatusCategory::permanent_error;
         case knowhere::Status::cancelled:
             return StatusCategory::cancelled;
@@ -248,6 +252,8 @@ Status2String(knowhere::Status status) {
             return "internal AiSAQ error";
         case knowhere::Status::knowhere_inner_error:
             return "knowhere inner error";
+        case knowhere::Status::fl_device_error:
+            return "FL device/runtime error (FlagOS backend)";
         case knowhere::Status::cancelled:
             return "cancelled by the caller";
         default:

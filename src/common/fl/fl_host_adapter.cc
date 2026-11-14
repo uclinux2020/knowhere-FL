@@ -80,11 +80,14 @@ host_stream_sync(void* /*stream*/) {
 }
 
 // topk over a candidate list defined by a lambda id accessor. Shared by
-// brute_force_topk (all ids) and ivf_flat_scan (subset).
+// brute_force_topk (all ids) and ivf_flat_scan (subset). xb_norms (L2 only,
+// may be nullptr) carries precomputed ||xb_j||^2 so the inner loop only
+// needs the dot product; when nullptr the base norm is accumulated inline.
 template <typename IdAt>
 void
 host_topk_over_candidates(const float* xb, int64_t dim, const float* xq, int64_t nq, const int64_t* cand_counts,
-                          int64_t k, int metric, IdAt&& id_at, float* out_dist, int64_t* out_ids) {
+                          int64_t k, int metric, const float* xb_norms, IdAt&& id_at, float* out_dist,
+                          int64_t* out_ids) {
 #pragma omp parallel for schedule(dynamic)
     for (int64_t i = 0; i < nq; ++i) {
         const float* q = xq + i * dim;
@@ -110,11 +113,12 @@ host_topk_over_candidates(const float* xb, int64_t dim, const float* xq, int64_t
             float dot = 0.f, nbsum = 0.f;
             for (int64_t d = 0; d < dim; ++d) {
                 dot += q[d] * b[d];
-                if (!is_ip) {
+                if (!is_ip && xb_norms == nullptr) {
                     nbsum += b[d] * b[d];
                 }
             }
-            const float dist = is_ip ? dot : (na + nbsum - 2.f * dot);
+            const float nb_norm = (xb_norms != nullptr) ? xb_norms[id] : nbsum;
+            const float dist = is_ip ? dot : (na + nb_norm - 2.f * dot);
             if (static_cast<int64_t>(heap.size()) < k) {
                 heap.emplace(dist, id);
             } else {
@@ -144,9 +148,26 @@ host_brute_force_topk(const void* xb, int64_t nb, const void* xq, int64_t nq, in
     if (xb == nullptr || xq == nullptr || out_dist == nullptr || out_ids == nullptr) {
         return -1;
     }
+    const float* base = static_cast<const float*>(xb);
+    // L2: precompute all base norms once (O(nb*dim)) so the O(nq*nb*dim) hot
+    // loop carries a single dot product per candidate.
+    std::vector<float> norms;
+    if (metric == 0) {
+        norms.resize(static_cast<size_t>(nb), 0.f);
+#pragma omp parallel for schedule(static)
+        for (int64_t j = 0; j < nb; ++j) {
+            const float* b = base + j * dim;
+            float s = 0.f;
+            for (int64_t d = 0; d < dim; ++d) {
+                s += b[d] * b[d];
+            }
+            norms[static_cast<size_t>(j)] = s;
+        }
+    }
     std::vector<int64_t> counts(nq, nb);
-    host_topk_over_candidates(static_cast<const float*>(xb), dim, static_cast<const float*>(xq), nq, counts.data(), k,
-                              metric, [](int64_t, int64_t c) { return c; }, out_dist, out_ids);
+    host_topk_over_candidates(base, dim, static_cast<const float*>(xq), nq, counts.data(), k, metric,
+                              norms.empty() ? nullptr : norms.data(), [](int64_t, int64_t c) { return c; }, out_dist,
+                              out_ids);
     return 0;
 }
 
@@ -162,8 +183,10 @@ host_ivf_flat_scan(const void* xb, int64_t /*nb*/, int64_t dim, const void* xq, 
     for (int64_t i = 0; i < nq; ++i) {
         counts[i] = cand_offsets[i + 1] - cand_offsets[i];
     }
+    // No shared norms LUT here: candidate sets are sparse subsets, so a
+    // full-base norms pass would cost more than the inline accumulation.
     host_topk_over_candidates(static_cast<const float*>(xb), dim, static_cast<const float*>(xq), nq, counts.data(), k,
-                              metric,
+                              metric, nullptr,
                               [cand_ids, cand_offsets](int64_t i, int64_t c) { return cand_ids[cand_offsets[i] + c]; },
                               out_dist, out_ids);
     return 0;
@@ -218,7 +241,9 @@ host_kmeans_assign(const void* xb, int64_t nb, int64_t dim, const void* centroid
 //      (device side computes this via mm against reshaped codebooks)
 //   2) scan: dist(q, v) = sum_m lut[m][codes[v * m + m]]
 // L2 LUT stores squared sub-distances; IP LUT stores sub dot products and the
-// scan maximizes the sum.
+// scan maximizes the sum. NOTE: the IP form is a contract-completeness
+// reference only — FL IVF_PQ rejects IP at Train/Deserialize because
+// plain-dot ADC mis-ranks (base norms are lost to quantization).
 int
 host_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, const void* codes, int64_t /*nb*/,
                  const void* xq, int64_t nq, int64_t /*dim*/, const int64_t* cand_ids, const int64_t* cand_offsets,
@@ -258,11 +283,15 @@ host_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, c
                 lut[static_cast<size_t>(s) * ksub + ks] = metric == 1 ? dot : (na + nc - 2.f * dot);
             }
         }
-        // 2) ADC scan over candidates
+        // 2) ADC scan over candidates with a bounded max-heap (same
+        // selection pattern as host_topk_over_candidates; avoids the
+        // previous O(nc) result vector + partial_sort).
         using Cand = std::pair<float, int64_t>;
         const bool is_ip = (metric == 1);
-        std::vector<Cand> best;
-        best.reserve(static_cast<size_t>(k) + 1);
+        auto cmp = [is_ip](const Cand& a, const Cand& b) {
+            return is_ip ? (a.first > b.first) : (a.first < b.first);
+        };
+        std::priority_queue<Cand, std::vector<Cand>, decltype(cmp)> heap(cmp);
         for (int64_t c = cand_offsets[i]; c < cand_offsets[i + 1]; ++c) {
             const int64_t id = cand_ids[c];
             const uint8_t* vc = pq_codes + static_cast<size_t>(id) * m;
@@ -270,19 +299,24 @@ host_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, c
             for (int64_t s = 0; s < m; ++s) {
                 dist += lut[static_cast<size_t>(s) * ksub + vc[s]];
             }
-            best.emplace_back(dist, id);
-        }
-        const int64_t nk = std::min<int64_t>(k, static_cast<int64_t>(best.size()));
-        std::partial_sort(best.begin(), best.begin() + nk, best.end(), [is_ip](const Cand& a, const Cand& b) {
-            return is_ip ? (a.first > b.first) : (a.first < b.first);
-        });
-        for (int64_t t = 0; t < k; ++t) {
-            if (t < nk) {
-                out_dist[i * k + t] = best[t].first;
-                out_ids[i * k + t] = best[t].second;
+            if (static_cast<int64_t>(heap.size()) < k) {
+                heap.emplace(dist, id);
             } else {
+                const float worst = heap.top().first;
+                if ((is_ip && dist > worst) || (!is_ip && dist < worst)) {
+                    heap.pop();
+                    heap.emplace(dist, id);
+                }
+            }
+        }
+        for (int64_t t = k - 1; t >= 0; --t) {
+            if (heap.empty()) {
                 out_dist[i * k + t] = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
                 out_ids[i * k + t] = -1;
+            } else {
+                out_dist[i * k + t] = heap.top().first;
+                out_ids[i * k + t] = heap.top().second;
+                heap.pop();
             }
         }
     }

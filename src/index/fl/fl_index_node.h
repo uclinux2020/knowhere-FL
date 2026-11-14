@@ -9,8 +9,8 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
-#ifndef FL_INDEX_NODE_H
-#define FL_INDEX_NODE_H
+#ifndef KNOWHERE_FL_INDEX_NODE_H
+#define KNOWHERE_FL_INDEX_NODE_H
 
 #include <algorithm>
 #include <cmath>
@@ -192,11 +192,17 @@ class FlBruteForceIndexNode : public IndexNode {
         if (!fl::ReadFormatHeader(reader, "BRUTE_FORCE")) {
             return Status::invalid_binary_set;
         }
-        reader(&dim_, sizeof(dim_), 1);
-        reader(&nb_, sizeof(nb_), 1);
-        reader(&metric_code_, sizeof(metric_code_), 1);
+        if (!fl::ReadChecked(reader, &dim_, sizeof(dim_), 1) || !fl::ReadChecked(reader, &nb_, sizeof(nb_), 1) ||
+            !fl::ReadChecked(reader, &metric_code_, sizeof(metric_code_), 1) ||
+            !fl::FlScalarDimsSane(dim_, nb_) || (metric_code_ != 0 && metric_code_ != 1)) {
+            LOG_KNOWHERE_WARNING_ << "FL BRUTE_FORCE deserialize: corrupt header";
+            return Status::invalid_binary_set;
+        }
         host_xb_.resize(static_cast<size_t>(nb_) * dim_);
-        reader(host_xb_.data(), sizeof(float), host_xb_.size());
+        if (!fl::ReadChecked(reader, host_xb_.data(), sizeof(float), host_xb_.size())) {
+            LOG_KNOWHERE_WARNING_ << "FL BRUTE_FORCE deserialize: truncated payload";
+            return Status::invalid_binary_set;
+        }
         TryStageToDevice();
         return Status::success;
     }
@@ -263,29 +269,35 @@ class FlBruteForceIndexNode : public IndexNode {
         }
         const fl::FlDeviceOps* ops = fl::GetDeviceOps();
         const size_t bytes = host_xb_.size() * sizeof(float);
-        if (!fl::FlMemoryPool::Instance().Ensure(bytes)) {
+        // Atomic reservation: on failure paths below the reservation is
+        // released with TrackFree; on success the tracked FlDeviceBuffer
+        // takes it over (its reset() performs the matching TrackFree).
+        if (!fl::FlMemoryPool::Instance().TryReserve(bytes)) {
             LOG_KNOWHERE_WARNING_ << "FL memory pool rejects staging " << bytes
                                   << " bytes; index will run on CPU fallback (design D5)";
             return;
         }
         if (ops->set_device == nullptr || ops->malloc == nullptr || ops->memcpy_h2d == nullptr) {
+            fl::FlMemoryPool::Instance().TrackFree(bytes);
             return;
         }
         // multi-device: this index is bound to one card for its lifetime
         device_id_ = fl::FlDeviceRouter::Instance().Acquire();
         if (ops->set_device(device_id_) != 0) {
+            fl::FlMemoryPool::Instance().TrackFree(bytes);
             return;
         }
         void* d = ops->malloc(bytes);
         if (d == nullptr) {
+            fl::FlMemoryPool::Instance().TrackFree(bytes);
             return;
         }
         if (ops->memcpy_h2d(d, host_xb_.data(), bytes, nullptr) != 0) {
             ops->free(d);
+            fl::FlMemoryPool::Instance().TrackFree(bytes);
             return;
         }
         dev_xb_ = fl::FlDeviceBuffer(d, bytes);
-        fl::FlMemoryPool::Instance().TrackAlloc(bytes);
         dev_ready_ = true;
         LOG_KNOWHERE_INFO_ << "FL brute force staged " << nb_ << " x " << dim_ << " vectors on device";
     }
@@ -304,26 +316,41 @@ class FlBruteForceIndexNode : public IndexNode {
         if (d_q == nullptr) {
             return expected<DataSetPtr>::Err(Status::fl_device_error, "FL device malloc for query failed");
         }
-        fl::FlDeviceBuffer q_guard(d_q, q_bytes);  // not pool-tracked: transient
+        fl::FlDeviceBuffer q_guard(d_q, q_bytes, false);  // transient: not pool-tracked
         if (ops->memcpy_h2d(d_q, xq, q_bytes, nullptr) != 0) {
             return expected<DataSetPtr>::Err(Status::fl_device_error, "FL H2D copy for query failed");
         }
 
-        auto* distances = new (std::nothrow) float[nq * k];
-        auto* ids = new (std::nothrow) int64_t[nq * k];
+        // Exact-index bitset semantics: the device kernel scans the whole
+        // base set, so filtered vectors could occupy top-k slots. Over-fetch
+        // by the number of filtered vectors (bounded by nb) so post-filtering
+        // still yields the true top-k of the unfiltered set - identical
+        // results to the CPU pre-filter path (bitset.count() >= number of
+        // filtered vectors inside any top-k window). When the filtered count
+        // is not known up-front (deferred/evaluator-backed bitsets) we
+        // over-fetch worst-case rather than risk under-fetching.
+        int64_t filtered = 0;
+        if (!bitset.empty()) {
+            filtered = bitset.has_known_count() ? static_cast<int64_t>(bitset.count())
+                                                : static_cast<int64_t>(bitset.size());
+        }
+        const int64_t fetch_k = std::min(nb_, k + filtered);
+        auto* distances = new (std::nothrow) float[nq * fetch_k];
+        auto* ids = new (std::nothrow) int64_t[nq * fetch_k];
         if (distances == nullptr || ids == nullptr) {
             delete[] distances;
             delete[] ids;
             return expected<DataSetPtr>::Err(Status::malloc_error, "host result alloc failed");
         }
-        int rc = ops->brute_force_topk(dev_xb_.get(), nb_, d_q, nq, dim_, k, metric_code_, distances, ids, nullptr);
+        int rc = ops->brute_force_topk(dev_xb_.get(), nb_, d_q, nq, dim_, fetch_k, metric_code_, distances, ids,
+                                       nullptr);
         if (rc != 0) {
             delete[] distances;
             delete[] ids;
             return expected<DataSetPtr>::Err(Status::fl_device_error, "FL brute_force_topk kernel failed");
         }
         if (!bitset.empty()) {
-            ApplyBitsetPostFilter(distances, ids, nq, k, bitset, metric_code_);
+            return CompactBitsetResults(distances, ids, nq, fetch_k, k, bitset, metric_code_);
         }
         return GenResultDataSet(nq, k, ids, distances);
     }
@@ -392,31 +419,43 @@ class FlBruteForceIndexNode : public IndexNode {
         return GenResultDataSet(nq, k, ids, distances);
     }
 
-    // Post-filter for the device path (the device kernel scans the whole
-    // base set, so bitset must be applied on the host afterwards). Results
-    // are compacted towards the front (same behavior as FL_CAGRA) so the
-    // first `valid` entries are always usable; empty slots are padded with
-    // -1 and the metric-appropriate worst distance.
-    static void
-    ApplyBitsetPostFilter(float* distances, int64_t* ids, int64_t nq, int64_t k, const BitsetView& bitset,
-                          int metric_code) {
+    // Compacts over-fetched device results (fetch_k per query, row stride
+    // fetch_k) down to the true top-k of the unfiltered set (row stride k).
+    // Takes ownership of the input buffers (frees them) and returns a fresh
+    // result dataset; empty slots are padded with -1 and the
+    // metric-appropriate worst distance.
+    static expected<DataSetPtr>
+    CompactBitsetResults(float* distances, int64_t* ids, int64_t nq, int64_t fetch_k, int64_t k,
+                         const BitsetView& bitset, int metric_code) {
         const float kWorst =
             (metric_code == 1) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+        auto* out_distances = new (std::nothrow) float[nq * k];
+        auto* out_ids = new (std::nothrow) int64_t[nq * k];
+        if (out_distances == nullptr || out_ids == nullptr) {
+            delete[] out_distances;
+            delete[] out_ids;
+            delete[] distances;
+            delete[] ids;
+            return expected<DataSetPtr>::Err(Status::malloc_error, "host compact alloc failed");
+        }
         for (int64_t i = 0; i < nq; ++i) {
             int64_t w = 0;
-            for (int64_t t = 0; t < k; ++t) {
-                const int64_t id = ids[i * k + t];
+            for (int64_t t = 0; t < fetch_k && w < k; ++t) {
+                const int64_t id = ids[i * fetch_k + t];
                 if (id >= 0 && !bitset.test(id)) {
-                    ids[i * k + w] = id;
-                    distances[i * k + w] = distances[i * k + t];
+                    out_ids[i * k + w] = id;
+                    out_distances[i * k + w] = distances[i * fetch_k + t];
                     ++w;
                 }
             }
             for (int64_t t = w; t < k; ++t) {
-                ids[i * k + t] = -1;
-                distances[i * k + t] = kWorst;
+                out_ids[i * k + t] = -1;
+                out_distances[i * k + t] = kWorst;
             }
         }
+        delete[] distances;
+        delete[] ids;
+        return GenResultDataSet(nq, k, out_ids, out_distances);
     }
 
     int64_t dim_{0};
@@ -430,4 +469,4 @@ class FlBruteForceIndexNode : public IndexNode {
 
 }  // namespace knowhere
 
-#endif  // FL_INDEX_NODE_H
+#endif  // KNOWHERE_FL_INDEX_NODE_H

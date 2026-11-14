@@ -9,8 +9,8 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
-#ifndef FL_BRUTE_FORCE_CONFIG_H
-#define FL_BRUTE_FORCE_CONFIG_H
+#ifndef KNOWHERE_FL_BRUTE_FORCE_CONFIG_H
+#define KNOWHERE_FL_BRUTE_FORCE_CONFIG_H
 
 #include <algorithm>
 #include <array>
@@ -25,6 +25,9 @@ namespace knowhere {
 // Design decision D4: COSINE is not a kernel metric on the FL path (same
 // constraint as the official GPU indexes). Callers must L2-normalize vectors
 // and use IP instead.
+// bitset semantics: exact. The device path over-fetches top-(k+filtered)
+// and compacts on host, so results are identical to the CPU pre-filter path
+// (always k valid entries whenever >= k unfiltered vectors exist).
 struct FlBruteForceConfig : public BaseConfig {
     Status
     CheckAndAdjust(PARAM_TYPE param_type, std::string* err_msg) override {
@@ -44,4 +47,4 @@ struct FlBruteForceConfig : public BaseConfig {
 
 }  // namespace knowhere
 
-#endif  // FL_BRUTE_FORCE_CONFIG_H
+#endif  // KNOWHERE_FL_BRUTE_FORCE_CONFIG_H

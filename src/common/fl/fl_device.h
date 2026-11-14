@@ -43,6 +43,8 @@ struct FlDeviceOps {
 
     // memory
     void* (*malloc)(size_t bytes);
+    // Contract: like std::free, must tolerate nullptr (callers pass it on
+    // partial-failure cleanup paths).
     void (*free)(void* ptr);
     int (*memcpy_h2d)(void* dst, const void* src, size_t bytes, void* stream);
     int (*memcpy_d2h)(void* dst, const void* src, size_t bytes, void* stream);
@@ -140,8 +142,11 @@ class FlMemoryPool {
         return pool;
     }
 
-    // (Re)configure pool limits in bytes. init_bytes is reserved eagerly on
-    // first use; max_bytes is the hard ceiling.
+    // (Re)configure pool limits in bytes. max_bytes is the hard ceiling.
+    // init_bytes is currently a reservation HINT only: it is stored and
+    // logged but no eager allocation is implemented yet (adapters allocate
+    // lazily through ops->malloc). Kept to mirror the official CUDA path's
+    // gpu.initMemSize knob.
     void
     Configure(size_t init_bytes, size_t max_bytes) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -158,18 +163,30 @@ class FlMemoryPool {
     void
     ConfigureFromEnv();
 
-    // Pre-flight admission check for an upcoming allocation of `bytes`.
-    // Returns true when the allocation fits within max_bytes_. Reserving here
-    // lets callers decide CPU fallback *before* touching the device.
+    // Pre-flight admission check AND atomic reservation for an upcoming
+    // allocation of `bytes`. Returns false without reserving when the pool
+    // cap would be exceeded; on success the bytes are already accounted, so
+    // concurrent threads cannot race past the ceiling (the previous
+    // check-then-TrackAlloc split had a TOCTOU hole). On failure callers
+    // must fall back to CPU instead of touching the device (design D5).
+    //
+    // IMPORTANT: on success the caller owns the reservation. If the actual
+    // allocation fails afterwards, it MUST call TrackFree(bytes) to release
+    // the reservation. On the RAII path, construct FlDeviceBuffer with
+    // tracked=true (the default) and skip the manual TrackAlloc call.
     bool
-    Ensure(size_t bytes) {
+    TryReserve(size_t bytes) {
         std::lock_guard<std::mutex> lk(mu_);
         if (max_bytes_ != 0 && used_ + bytes > max_bytes_) {
             return false;
         }
+        used_ += bytes;
         return true;
     }
 
+    // Manual accounting for code paths that manage raw ops->malloc/free
+    // without FlDeviceBuffer (e.g. the kmeans training staging loop). New
+    // code should prefer TryReserve + tracked FlDeviceBuffer.
     void
     TrackAlloc(size_t bytes) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -198,16 +215,46 @@ class FlMemoryPool {
 
 // RAII helper for device buffers allocated through the ops table. Frees on
 // destruction and keeps the pool accounting in sync.
+//
+// The free function is captured at construction (not re-read from the global
+// ops table at destruction), so a buffer allocated by adapter A is never
+// freed through a re-registered adapter B. `tracked` must mirror whether the
+// owner accounted this allocation with FlMemoryPool::TrackAlloc: only tracked
+// buffers are TrackFree'd on release. Transient buffers the caller never
+// tracked must pass tracked=false, otherwise the pool counter would be
+// driven negative (clamped to 0) and corrupt every later OOM pre-check.
 class FlDeviceBuffer {
  public:
     FlDeviceBuffer() = default;
-    FlDeviceBuffer(void* ptr, size_t bytes) : ptr_(ptr), bytes_(bytes) {}
+    explicit FlDeviceBuffer(void* ptr, size_t bytes, bool tracked = true)
+        : ptr_(ptr),
+          bytes_(bytes),
+          free_fn_(CaptureFreeFn()),
+          tracked_(tracked && ptr != nullptr) {}
     FlDeviceBuffer(const FlDeviceBuffer&) = delete;
     FlDeviceBuffer&
     operator=(const FlDeviceBuffer&) = delete;
-    FlDeviceBuffer(FlDeviceBuffer&& o) noexcept : ptr_(o.ptr_), bytes_(o.bytes_) {
+    FlDeviceBuffer(FlDeviceBuffer&& o) noexcept
+        : ptr_(o.ptr_), bytes_(o.bytes_), free_fn_(o.free_fn_), tracked_(o.tracked_) {
         o.ptr_ = nullptr;
         o.bytes_ = 0;
+        o.free_fn_ = nullptr;
+        o.tracked_ = false;
+    }
+    FlDeviceBuffer&
+    operator=(FlDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            reset();
+            ptr_ = o.ptr_;
+            bytes_ = o.bytes_;
+            free_fn_ = o.free_fn_;
+            tracked_ = o.tracked_;
+            o.ptr_ = nullptr;
+            o.bytes_ = 0;
+            o.free_fn_ = nullptr;
+            o.tracked_ = false;
+        }
+        return *this;
     }
     ~FlDeviceBuffer() {
         reset();
@@ -229,9 +276,23 @@ class FlDeviceBuffer {
     void
     reset();
 
+    // True when this buffer is accounted in FlMemoryPool (paired TrackAlloc /
+    // TrackFree). Transient buffers report false.
+    bool
+    tracked() const {
+        return tracked_;
+    }
+
  private:
+    static void (*CaptureFreeFn())(void*) {
+        const FlDeviceOps* ops = GetDeviceOps();
+        return (ops != nullptr) ? ops->free : nullptr;
+    }
+
     void* ptr_{nullptr};
     size_t bytes_{0};
+    void (*free_fn_)(void*){nullptr};  // captured at construction
+    bool tracked_{false};              // pool-accounted by the owner
 };
 
 }  // namespace fl

@@ -9,8 +9,8 @@
 // distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
-#ifndef FL_CAGRA_NODE_H
-#define FL_CAGRA_NODE_H
+#ifndef KNOWHERE_FL_CAGRA_NODE_H
+#define KNOWHERE_FL_CAGRA_NODE_H
 
 #include <algorithm>
 #include <cmath>
@@ -119,8 +119,15 @@ class FlCagraIndexNode : public IndexNode {
             return expected<DataSetPtr>::Err(Status::empty_index, "FL_CAGRA index is empty");
         }
 
-        std::vector<float> dist(static_cast<size_t>(nq) * k);
-        std::vector<int64_t> ids(static_cast<size_t>(nq) * k);
+        // GenResultDataSet takes ownership (IsOwner=true), so the result
+        // buffers must be new[]-allocated, never std::vector::data().
+        auto* dist = new (std::nothrow) float[static_cast<size_t>(nq) * k];
+        auto* ids = new (std::nothrow) int64_t[static_cast<size_t>(nq) * k];
+        if (dist == nullptr || ids == nullptr) {
+            delete[] dist;
+            delete[] ids;
+            return expected<DataSetPtr>::Err(Status::malloc_error, "FL_CAGRA host result alloc failed");
+        }
 
         bool done = false;
         if (dev_ready_) {
@@ -132,7 +139,7 @@ class FlCagraIndexNode : public IndexNode {
                 void* d_xq = ops->malloc(q_bytes);
                 if (d_xq != nullptr && ops->memcpy_h2d(d_xq, xq, q_bytes, nullptr) == 0) {
                     done = ops->graph_search(dev_xb_.get(), nb_, dim_, graph_ids_.data(), graph_offsets_.data(),
-                                             graph_degree_, d_xq, nq, k, itopk, metric_code_, dist.data(), ids.data(),
+                                             graph_degree_, d_xq, nq, k, itopk, metric_code_, dist, ids,
                                              nullptr) == 0;
                 }
                 if (d_xq != nullptr) {
@@ -145,11 +152,14 @@ class FlCagraIndexNode : public IndexNode {
         }
         if (!done) {
             fl::FlGraphSearchCpu(host_xb_.data(), nb_, dim_, graph_ids_.data(), graph_offsets_.data(), graph_degree_,
-                                 xq, nq, k, itopk, metric_code_, dist.data(), ids.data());
+                                 xq, nq, k, itopk, metric_code_, dist, ids);
         }
 
         // post-filter bitset (official GPU_CAGRA rejects filtered search; the
-        // FL path degrades gracefully by filtering the traversal results)
+        // FL path degrades gracefully by filtering the traversal results.
+        // Caveat: this can return fewer than k valid entries when filtered
+        // vectors occupy traversal top-k slots - acceptable for an ANN
+        // index, unlike exact brute force which over-fetches instead)
         if (!bitset.empty()) {
             for (int64_t i = 0; i < nq; ++i) {
                 int64_t w = 0;
@@ -169,7 +179,7 @@ class FlCagraIndexNode : public IndexNode {
             }
         }
 
-        return GenResultDataSet(nq, k, ids.data(), dist.data());
+        return GenResultDataSet(nq, k, ids, dist);
     }
 
     expected<DataSetPtr>
@@ -217,6 +227,12 @@ class FlCagraIndexNode : public IndexNode {
 
     Status
     Serialize(BinarySet& binset) const override {
+        if (nb_ == 0) {
+            // Consistent with the other FL nodes (and with Deserialize,
+            // which rejects empty payloads via FlScalarDimsSane).
+            LOG_KNOWHERE_ERROR_ << "Can not serialize empty FL_CAGRA index.";
+            return Status::empty_index;
+        }
         try {
             MemoryIOWriter writer;
             fl::WriteFormatHeader(writer);
@@ -236,7 +252,7 @@ class FlCagraIndexNode : public IndexNode {
             return Status::success;
         } catch (const std::exception& e) {
             LOG_KNOWHERE_WARNING_ << "FL_CAGRA serialize failed: " << e.what();
-            return Status::inner_error;
+            return Status::knowhere_inner_error;
         }
     }
 
@@ -248,18 +264,38 @@ class FlCagraIndexNode : public IndexNode {
         }
         MemoryIOReader reader(binary->data.get(), binary->size);
         if (!fl::ReadFormatHeader(reader, "FL_CAGRA")) {
-            return Status::format_error;
+            return Status::invalid_binary_set;
         }
-        reader(&dim_, sizeof(dim_), 1);
-        reader(&nb_, sizeof(nb_), 1);
-        reader(&graph_degree_, sizeof(graph_degree_), 1);
-        reader(&metric_code_, sizeof(metric_code_), 1);
+        if (!fl::ReadChecked(reader, &dim_, sizeof(dim_), 1) || !fl::ReadChecked(reader, &nb_, sizeof(nb_), 1) ||
+            !fl::ReadChecked(reader, &graph_degree_, sizeof(graph_degree_), 1) ||
+            !fl::ReadChecked(reader, &metric_code_, sizeof(metric_code_), 1) ||
+            !fl::FlScalarDimsSane(dim_, nb_) || graph_degree_ <= 0 || graph_degree_ > nb_ ||
+            (metric_code_ != 0 && metric_code_ != 1)) {
+            LOG_KNOWHERE_WARNING_ << "FL_CAGRA deserialize: corrupt header";
+            return Status::invalid_binary_set;
+        }
         host_xb_.resize(static_cast<size_t>(nb_) * dim_);
-        reader(host_xb_.data(), sizeof(float), host_xb_.size());
         graph_ids_.resize(static_cast<size_t>(nb_) * graph_degree_);
-        reader(graph_ids_.data(), sizeof(int64_t), graph_ids_.size());
         graph_offsets_.resize(static_cast<size_t>(nb_) + 1);
-        reader(graph_offsets_.data(), sizeof(int64_t), graph_offsets_.size());
+        if (!fl::ReadChecked(reader, host_xb_.data(), sizeof(float), host_xb_.size()) ||
+            !fl::ReadChecked(reader, graph_ids_.data(), sizeof(int64_t), graph_ids_.size()) ||
+            !fl::ReadChecked(reader, graph_offsets_.data(), sizeof(int64_t), graph_offsets_.size())) {
+            LOG_KNOWHERE_WARNING_ << "FL_CAGRA deserialize: truncated payload";
+            return Status::invalid_binary_set;
+        }
+        // CSR structure check: offsets must be monotone and terminate at the
+        // ids payload length (defense against corrupt payloads feeding the
+        // traversal out-of-bounds reads).
+        if (graph_offsets_[0] != 0 || graph_offsets_[nb_] != static_cast<int64_t>(graph_ids_.size())) {
+            LOG_KNOWHERE_WARNING_ << "FL_CAGRA deserialize: CSR offsets mismatch";
+            return Status::invalid_binary_set;
+        }
+        for (int64_t r = 0; r < nb_; ++r) {
+            if (graph_offsets_[r] > graph_offsets_[r + 1]) {
+                LOG_KNOWHERE_WARNING_ << "FL_CAGRA deserialize: non-monotone CSR offsets";
+                return Status::invalid_binary_set;
+            }
+        }
         TryStageToDevice();
         return Status::success;
     }
@@ -396,20 +432,21 @@ class FlCagraIndexNode : public IndexNode {
             return;
         }
         const size_t bytes = static_cast<size_t>(nb_) * dim_ * sizeof(float);
-        if (!fl::FlMemoryPool::Instance().Ensure(bytes)) {
+        if (!fl::FlMemoryPool::Instance().TryReserve(bytes)) {
             LOG_KNOWHERE_WARNING_ << "FL_CAGRA staging " << bytes << "B exceeds pool cap; staying on CPU (D5)";
             return;
         }
         void* d_xb = ops->malloc(bytes);
         if (d_xb == nullptr) {
+            fl::FlMemoryPool::Instance().TrackFree(bytes);
             return;
         }
         if (ops->memcpy_h2d(d_xb, host_xb_.data(), bytes, nullptr) != 0) {
             ops->free(d_xb);
+            fl::FlMemoryPool::Instance().TrackFree(bytes);
             return;
         }
         dev_xb_ = fl::FlDeviceBuffer(d_xb, bytes);
-        fl::FlMemoryPool::Instance().TrackAlloc(bytes);
         dev_ready_ = true;
     }
 
@@ -429,4 +466,4 @@ class FlCagraIndexNode : public IndexNode {
 
 }  // namespace knowhere
 
-#endif  // FL_CAGRA_NODE_H
+#endif  // KNOWHERE_FL_CAGRA_NODE_H

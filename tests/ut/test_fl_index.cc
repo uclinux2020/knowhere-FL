@@ -378,6 +378,11 @@ TEST_CASE("FL_IVF_PQ rejects invalid train params", "[fl]") {
     // COSINE rejected per design D4
     knowhere::Json cosine = knowhere::Json::parse(R"({"metric_type":"COSINE","dim":16,"nlist":16,"m":4,"nbits":8})");
     REQUIRE(idx.Build(base, cosine) == knowhere::Status::invalid_metric_type);
+
+    // IP rejected: plain-dot PQ ADC cannot decompose IP distance (base norms
+    // are lost to quantization); FL IVF_PQ is L2-only
+    knowhere::Json ip = knowhere::Json::parse(R"({"metric_type":"IP","dim":16,"nlist":16,"m":4,"nbits":8})");
+    REQUIRE(idx.Build(base, ip) == knowhere::Status::invalid_metric_type);
 }
 
 TEST_CASE("FL device router round-robin", "[fl]") {
@@ -604,8 +609,8 @@ TEST_CASE("FL_CAGRA GetVectorByIds returns raw vectors", "[fl]") {
     }
 }
 
-TEST_CASE("FL_BRUTE_FORCE bitset post-filter compacts results", "[fl]") {
-    knowhere::fl::RegisterHostAdapter();  // device path: kernel scans the full base, bitset applied on host
+TEST_CASE("FL_BRUTE_FORCE bitset over-fetch keeps exact top-k", "[fl]") {
+    knowhere::fl::RegisterHostAdapter();  // device path: kernel over-fetches, host compacts to exact top-k
     auto base = GenDataSet(kNb, kDim, 42);
     auto query = GenDataSet(1, kDim, 7);
 
@@ -623,15 +628,13 @@ TEST_CASE("FL_BRUTE_FORCE bitset post-filter compacts results", "[fl]") {
     auto filtered = idx.Search(query, search, knowhere::BitsetView(bits.data(), kNb));
     REQUIRE(filtered.has_value());
     const auto* fids = filtered.value()->GetIds();
-    // banned id must not appear, and the remaining results must stay
-    // front-packed (no -1 holes before the tail)
-    bool seen_pad = false;
+    // exact semantics: banning the rank-0 hit must shift every later rank up
+    // by one and still deliver a full top-k (no padding holes)
     for (int64_t t = 0; t < kK; ++t) {
+        REQUIRE(fids[t] >= 0);
         REQUIRE(fids[t] != banned);
-        if (fids[t] == -1) {
-            seen_pad = true;
-        } else {
-            REQUIRE_FALSE(seen_pad);  // no valid result after a padding hole
+        if (t < kK - 1) {
+            REQUIRE(fids[t] == unfiltered.value()->GetIds()[t + 1]);
         }
     }
     knowhere::fl::UnregisterHostAdapter();

@@ -62,18 +62,22 @@ def update_on_device(x: torch.Tensor, owner: torch.Tensor, nlist: int) -> torch.
 
 
 def update_on_cpu(x: torch.Tensor, owner: torch.Tensor, nlist: int) -> torch.Tensor:
-    """CPU scatter-add update (the C++ hybrid mode's update step)."""
+    """CPU scatter-add update (the C++ hybrid mode's update step).
+
+    Vectorized index_add on CPU tensors (same semantics as the C++ serial
+    loop; the previous per-row Python loop was O(nb) interpreter time and
+    dominated the benchmark, skewing the hybrid-vs-device verdict).
+    """
     dim = x.shape[1]
-    x_cpu = x.cpu()
+    x_cpu = x.cpu().to(torch.float64)
     owner_cpu = owner.cpu()
     sums = torch.zeros(nlist, dim, dtype=torch.float64)
-    counts = torch.zeros(nlist, dtype=torch.int64)
-    for j in range(x_cpu.shape[0]):
-        c = int(owner_cpu[j])
-        counts[c] += 1
-        sums[c] += x_cpu[j].to(torch.float64)
-    counts_f = counts.clamp(min=1).to(torch.float64)
-    return (sums / counts_f.unsqueeze(1)).to(torch.float32).to(x.device)
+    counts = torch.zeros(nlist, dtype=torch.float64)
+    ones = torch.ones_like(owner_cpu, dtype=torch.float64)
+    sums.index_add_(0, owner_cpu, x_cpu)
+    counts.index_add_(0, owner_cpu, ones)
+    counts.clamp_(min=1.0)
+    return (sums / counts.unsqueeze(1)).to(torch.float32).to(x.device)
 
 
 def lloyd(x: torch.Tensor, nlist: int, iters: int, update: str, seed: int = 42):
@@ -103,8 +107,9 @@ def lloyd(x: torch.Tensor, nlist: int, iters: int, update: str, seed: int = 42):
 
 
 def _sync(x: torch.Tensor):
+    """Synchronize the active accelerator (PPU/Ascend/DCU are NOT cuda)."""
     if x.device.type != "cpu":
-        torch.cuda.synchronize()
+        torch.get_device_module(x.device.type).synchronize()
 
 
 def faiss_reference(x: torch.Tensor, nlist: int, iters: int):

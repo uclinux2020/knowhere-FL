@@ -41,8 +41,9 @@ def enable_flaggems():
 
 
 def sync(dev):
+    """Synchronize the active accelerator (PPU/Ascend/DCU are NOT cuda)."""
     if dev.type != "cpu":
-        torch.cuda.synchronize()
+        torch.get_device_module(dev.type).synchronize()
 
 
 def ivf_flat_scan_compose(xb, q, cand_ids, cand_offsets, k):
@@ -92,6 +93,8 @@ def ivf_pq_scan_compose(codebooks, codes, q, cand_ids, cand_offsets, m, ksub, ds
 
 
 def bench(fn, iters, dev):
+    fn()  # warmup: Triton JIT compile must not pollute the first timed run
+    sync(dev)
     times = []
     for _ in range(iters):
         t0 = time.perf_counter()

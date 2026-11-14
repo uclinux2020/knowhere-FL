@@ -9,8 +9,8 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
-#ifndef FL_KMEANS_CPU_H
-#define FL_KMEANS_CPU_H
+#ifndef KNOWHERE_FL_KMEANS_CPU_H
+#define KNOWHERE_FL_KMEANS_CPU_H
 
 #include <algorithm>
 #include <cstring>
@@ -39,6 +39,19 @@ namespace fl {
 inline void
 LloydKmeansCpu(const float* x, int64_t nb, int64_t dim, int64_t nlist, int metric_code, float* centroids,
                int64_t* owner_out = nullptr, int max_iters = 25, uint64_t seed = 42) {
+    if (x == nullptr || nb <= 0 || dim <= 0 || nlist <= 0 || centroids == nullptr) {
+        LOG_KNOWHERE_WARNING_ << "FL LloydKmeansCpu: invalid args (nb=" << nb << " dim=" << dim
+                              << " nlist=" << nlist << "); centroids left untouched";
+        if (owner_out != nullptr && nb > 0) {
+            std::fill_n(owner_out, nb, int64_t{0});
+        }
+        return;
+    }
+    if (nlist > nb) {
+        // The seeded init samples without replacement; clamp defensively.
+        LOG_KNOWHERE_WARNING_ << "FL LloydKmeansCpu: nlist(" << nlist << ") > nb(" << nb << "), clamping";
+        nlist = nb;
+    }
     std::mt19937_64 rng(seed);
     std::vector<int64_t> perm(nb);
     std::iota(perm.begin(), perm.end(), 0);
@@ -134,4 +147,4 @@ LloydKmeansCpu(const float* x, int64_t nb, int64_t dim, int64_t nlist, int metri
 }  // namespace fl
 }  // namespace knowhere
 
-#endif  // FL_KMEANS_CPU_H
+#endif  // KNOWHERE_FL_KMEANS_CPU_H

@@ -9,8 +9,8 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
-#ifndef FL_IVF_PQ_CONFIG_H
-#define FL_IVF_PQ_CONFIG_H
+#ifndef KNOWHERE_FL_IVF_PQ_CONFIG_H
+#define KNOWHERE_FL_IVF_PQ_CONFIG_H
 
 #include <algorithm>
 #include <array>
@@ -23,8 +23,12 @@ namespace knowhere {
 
 // Config for the FL (FlagOS) IVF_PQ index. Parameter names/ranges mirror the
 // official GPU_IVF_PQ semantics (design D2). v1 constraints:
+//   - metric: L2 only (plain-dot PQ ADC cannot decompose IP distance; see
+//     the node header note)
 //   - nbits must be 8 (one uint8 code per subquantizer)
 //   - dim must be divisible by m
+// bitset semantics: exact pre-filter inside the probed lists (same as
+// IVF_FLAT).
 struct FlIvfPqConfig : public BaseConfig {
     CFG_INT nlist;
     CFG_INT nprobe;
@@ -53,12 +57,14 @@ struct FlIvfPqConfig : public BaseConfig {
     Status
     CheckAndAdjust(PARAM_TYPE param_type, std::string* err_msg) override {
         if (param_type == PARAM_TYPE::TRAIN) {
-            constexpr std::array<std::string_view, 2> legal_metric_list{"L2", "IP"};
+            constexpr std::array<std::string_view, 1> legal_metric_list{"L2"};
             std::string metric = metric_type.value();
             if (std::find(legal_metric_list.begin(), legal_metric_list.end(), metric) == legal_metric_list.end()) {
                 std::string msg = "metric type " + metric +
-                                  " not supported on FL path, supported: [L2 IP]; "
-                                  "for COSINE, L2-normalize vectors and use IP (design D4)";
+                                  " not supported on FL IVF_PQ (supported: [L2]); plain-dot PQ LUT "
+                                  "decompositions mis-rank under IP (base-vector norms are lost to "
+                                  "quantization), and COSINE is excluded per design D4 - normalize "
+                                  "vectors and use IVF_FLAT/BRUTE_FORCE with IP instead";
                 return HandleError(err_msg, msg, Status::invalid_metric_type);
             }
             if (nbits.value() != 8) {
@@ -80,4 +86,4 @@ struct FlIvfPqConfig : public BaseConfig {
 
 }  // namespace knowhere
 
-#endif  // FL_IVF_PQ_CONFIG_H
+#endif  // KNOWHERE_FL_IVF_PQ_CONFIG_H

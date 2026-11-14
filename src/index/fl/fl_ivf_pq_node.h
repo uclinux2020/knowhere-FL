@@ -9,8 +9,8 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
-#ifndef FL_IVF_PQ_NODE_H
-#define FL_IVF_PQ_NODE_H
+#ifndef KNOWHERE_FL_IVF_PQ_NODE_H
+#define KNOWHERE_FL_IVF_PQ_NODE_H
 
 #include <algorithm>
 #include <cmath>
@@ -53,7 +53,13 @@ namespace knowhere {
 //     D5, CPU fallback).
 //   - Search: host centroid routing -> candidate lists -> device
 //     ops->ivf_pq_scan (per-query LUT via mm composition + ADC scan) with
-//     CPU ADC fallback. bitset pre-filter + post-filter double insurance.
+//     CPU ADC fallback. bitset is pre-filtered in BuildCandidateLists (both
+//     device and CPU scans receive pre-filtered candidates).
+//   - Metric: L2 only. IP is rejected outright (Train and Deserialize):
+//     a plain-dot PQ LUT cannot decompose IP distance because the
+//     base-vector norm ||x|| is lost to quantization, so ADC accumulations
+//     mis-rank. COSINE stays excluded per design D4. Callers needing IP
+//     must use FL IVF_FLAT or BRUTE_FORCE instead.
 // ---------------------------------------------------------------------------
 template <typename DataType>
 class FlIvfPqIndexNode : public IndexNode {
@@ -68,9 +74,10 @@ class FlIvfPqIndexNode : public IndexNode {
         const std::string metric = f_cfg.metric_type.value();
         if (metric == "L2") {
             metric_code_ = 0;
-        } else if (metric == "IP") {
-            metric_code_ = 1;
         } else {
+            // IP rejected: plain-dot ADC cannot decompose IP distance (base
+            // norms are lost to quantization); see the class header note.
+            LOG_KNOWHERE_ERROR_ << "FL IVF_PQ supports L2 only, got metric: " << metric;
             return Status::invalid_metric_type;
         }
         dim_ = dataset->GetDim();
@@ -274,26 +281,48 @@ class FlIvfPqIndexNode : public IndexNode {
         if (!fl::ReadFormatHeader(reader, "IVF_PQ")) {
             return Status::invalid_binary_set;
         }
-        reader(&dim_, sizeof(dim_), 1);
-        reader(&nb_, sizeof(nb_), 1);
-        reader(&nlist_, sizeof(nlist_), 1);
-        reader(&m_, sizeof(m_), 1);
-        reader(&ksub_, sizeof(ksub_), 1);
-        reader(&dsub_, sizeof(dsub_), 1);
-        reader(&metric_code_, sizeof(metric_code_), 1);
+        if (!fl::ReadChecked(reader, &dim_, sizeof(dim_), 1) || !fl::ReadChecked(reader, &nb_, sizeof(nb_), 1) ||
+            !fl::ReadChecked(reader, &nlist_, sizeof(nlist_), 1) || !fl::ReadChecked(reader, &m_, sizeof(m_), 1) ||
+            !fl::ReadChecked(reader, &ksub_, sizeof(ksub_), 1) || !fl::ReadChecked(reader, &dsub_, sizeof(dsub_), 1) ||
+            !fl::ReadChecked(reader, &metric_code_, sizeof(metric_code_), 1) || !fl::FlScalarDimsSane(dim_, nb_) ||
+            nlist_ <= 0 || nlist_ > nb_ || m_ <= 0 || ksub_ != 256 || dsub_ <= 0 || m_ * dsub_ != dim_) {
+            LOG_KNOWHERE_WARNING_ << "FL IVF_PQ deserialize: corrupt header";
+            return Status::invalid_binary_set;
+        }
+        if (metric_code_ != 0) {
+            // Refuse to load legacy IP-encoded FL IVF_PQ payloads: their ADC
+            // results mis-rank by design (see class header note).
+            LOG_KNOWHERE_ERROR_ << "FL IVF_PQ deserialize: payload metric is IP; L2-only since v1";
+            return Status::invalid_binary_set;
+        }
         centroids_.resize(static_cast<size_t>(nlist_) * dim_);
-        reader(centroids_.data(), sizeof(float), centroids_.size());
         codebooks_.resize(static_cast<size_t>(m_) * ksub_ * dsub_);
-        reader(codebooks_.data(), sizeof(float), codebooks_.size());
         codes_.resize(static_cast<size_t>(nb_) * m_);
-        reader(codes_.data(), sizeof(uint8_t), codes_.size());
+        if (!fl::ReadChecked(reader, centroids_.data(), sizeof(float), centroids_.size()) ||
+            !fl::ReadChecked(reader, codebooks_.data(), sizeof(float), codebooks_.size()) ||
+            !fl::ReadChecked(reader, codes_.data(), sizeof(uint8_t), codes_.size())) {
+            LOG_KNOWHERE_WARNING_ << "FL IVF_PQ deserialize: truncated payload";
+            return Status::invalid_binary_set;
+        }
         invlists_.assign(nlist_, {});
         for (int64_t l = 0; l < nlist_; ++l) {
             int64_t sz = 0;
-            reader(&sz, sizeof(sz), 1);
-            invlists_[l].resize(sz);
+            if (!fl::ReadChecked(reader, &sz, sizeof(sz), 1) || sz < 0 || sz > nb_) {
+                LOG_KNOWHERE_WARNING_ << "FL IVF_PQ deserialize: corrupt inverted list header";
+                return Status::invalid_binary_set;
+            }
+            invlists_[l].resize(static_cast<size_t>(sz));
             if (sz > 0) {
-                reader(invlists_[l].data(), sizeof(int64_t), sz);
+                if (!fl::ReadChecked(reader, invlists_[l].data(), sizeof(int64_t), static_cast<size_t>(sz))) {
+                    LOG_KNOWHERE_WARNING_ << "FL IVF_PQ deserialize: truncated inverted list";
+                    return Status::invalid_binary_set;
+                }
+                for (auto id : invlists_[l]) {
+                    if (id < 0 || id >= nb_) {
+                        LOG_KNOWHERE_WARNING_ << "FL IVF_PQ deserialize: member id out of range";
+                        return Status::invalid_binary_set;
+                    }
+                }
             }
         }
         RefreshCentroidNorms();
@@ -359,7 +388,6 @@ class FlIvfPqIndexNode : public IndexNode {
 
  private:
     // nearest entry in `table` (n rows of width `width`) for subvector v
-    int64_t
     // Squared norms of `n` row vectors of width `width` (L2 only; callers
     // skip this entirely for IP).
     static std::vector<float>
@@ -527,16 +555,18 @@ class FlIvfPqIndexNode : public IndexNode {
         const fl::FlDeviceOps* ops = fl::GetDeviceOps();
         const size_t cb_bytes = codebooks_.size() * sizeof(float);
         const size_t code_bytes = codes_.size() * sizeof(uint8_t);
-        if (!fl::FlMemoryPool::Instance().Ensure(cb_bytes + code_bytes)) {
+        if (!fl::FlMemoryPool::Instance().TryReserve(cb_bytes + code_bytes)) {
             LOG_KNOWHERE_WARNING_ << "FL memory pool rejects staging " << (cb_bytes + code_bytes)
                                   << " bytes; IVF_PQ on CPU fallback";
             return;
         }
         if (ops->set_device == nullptr || ops->malloc == nullptr || ops->memcpy_h2d == nullptr) {
+            fl::FlMemoryPool::Instance().TrackFree(cb_bytes + code_bytes);
             return;
         }
         device_id_ = fl::FlDeviceRouter::Instance().Acquire();
         if (ops->set_device(device_id_) != 0) {
+            fl::FlMemoryPool::Instance().TrackFree(cb_bytes + code_bytes);
             return;
         }
         void* d_cb = ops->malloc(cb_bytes);
@@ -551,11 +581,11 @@ class FlIvfPqIndexNode : public IndexNode {
             if (d_codes != nullptr) {
                 ops->free(d_codes);
             }
+            fl::FlMemoryPool::Instance().TrackFree(cb_bytes + code_bytes);
             return;
         }
         dev_codebooks_ = fl::FlDeviceBuffer(d_cb, cb_bytes);
         dev_codes_ = fl::FlDeviceBuffer(d_codes, code_bytes);
-        fl::FlMemoryPool::Instance().TrackAlloc(cb_bytes + code_bytes);
         dev_ready_ = true;
         LOG_KNOWHERE_INFO_ << "FL IVF_PQ staged codebooks+codes on device (" << (cb_bytes + code_bytes) << " bytes)";
     }
@@ -580,4 +610,4 @@ class FlIvfPqIndexNode : public IndexNode {
 
 }  // namespace knowhere
 
-#endif  // FL_IVF_PQ_NODE_H
+#endif  // KNOWHERE_FL_IVF_PQ_NODE_H

@@ -92,6 +92,12 @@ knowhere_option(WITH_FAISS_TESTS "Build with Faiss unit tests" OFF)
 knowhere_option(WITH_LIGHT "Build with light weight version" OFF)
 knowhere_option(WITH_COMPILE_PRUNE "Enable compile prune" ON)
 
+if(WITH_FL AND WITH_LIGHT)
+  # The FL registration .cc files pull the full IndexNode interface, which
+  # the light build strips; fail loudly instead of compiling to nothing.
+  message(FATAL_ERROR "WITH_FL requires the full IndexNode interface and is incompatible with WITH_LIGHT")
+endif()
+
 
 set(KNOWHERE_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 set(KNOWHERE_THRID_ROOT ${KNOWHERE_ROOT}/thirdparty)

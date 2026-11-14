@@ -37,6 +37,17 @@ def enable_flaggems():
         print(f"[fl] FlagGems not enabled ({e}); running on stock backend")
 
 
+def sync_device(dev: torch.device):
+    """Synchronize the active accelerator (PPU/Ascend/DCU are NOT cuda).
+
+    torch.get_device_module routes to the correct backend module; hardcoded
+    torch.cuda.synchronize() would break or silently mistime on non-NVIDIA
+    FlagOS targets.
+    """
+    if dev.type != "cpu":
+        torch.get_device_module(dev.type).synchronize()
+
+
 def l2_distance_matrix(q: torch.Tensor, xb: torch.Tensor) -> torch.Tensor:
     """L2 via GEMM decomposition: ||q||^2 + ||xb||^2 - 2 q@xb.T.
 
@@ -95,8 +106,7 @@ def main():
     # warmup + correctness
     t0 = time.perf_counter()
     vals, ids = brute_force_topk(q, xb, args.k, args.metric)
-    if dev.type != "cpu":
-        torch.cuda.synchronize()
+    sync_device(dev)
     t1 = time.perf_counter()
 
     gt_dist, gt_ids = faiss_ground_truth(q, xb, args.k, args.metric)
@@ -108,8 +118,7 @@ def main():
     for _ in range(args.iters):
         ta = time.perf_counter()
         brute_force_topk(q, xb, args.k, args.metric)
-        if dev.type != "cpu":
-            torch.cuda.synchronize()
+        sync_device(dev)
         times.append(time.perf_counter() - ta)
     times.sort()
     p50 = times[len(times) // 2]

@@ -11,6 +11,9 @@
 
 #include "common/fl/fl_device.h"
 
+#include <atomic>
+#include <cerrno>
+#include <climits>
 #include <cstdlib>
 
 #include "knowhere/log.h"
@@ -19,21 +22,36 @@ namespace knowhere {
 namespace fl {
 
 namespace {
-const FlDeviceOps* g_ops = nullptr;
+// Published with release semantics so late-joining search threads never
+// observe a half-written ops table (registration itself is still
+// single-threaded by contract, per fl_device.h).
+std::atomic<const FlDeviceOps*> g_ops{nullptr};
 
 // Parses a non-negative MiB value from an env var; returns -1 when unset or
-// invalid. Defined for ConfigureFromEnv only.
+// invalid. Out-of-range values are clamped (they would otherwise wrap when
+// scaled to bytes). Defined for ConfigureFromEnv only.
 long long
 ParseEnvMiB(const char* name) {
     const char* raw = std::getenv(name);
     if (raw == nullptr || *raw == '\0') {
         return -1;
     }
+    errno = 0;
     char* end = nullptr;
-    const long long v = std::strtoll(raw, &end, 10);
+    long long v = std::strtoll(raw, &end, 10);
+    if (errno == ERANGE) {
+        LOG_KNOWHERE_WARNING_ << "FL memory pool: clamping out-of-range " << name << "=\"" << raw << "\"";
+        v = (v < 0) ? 0 : LLONG_MAX / (1024 * 1024);  // avoid overflow at MiB->bytes
+    }
     if (end == raw || *end != '\0' || v < 0) {
         LOG_KNOWHERE_WARNING_ << "FL memory pool: ignoring invalid " << name << "=\"" << raw << "\"";
         return -1;
+    }
+    // clamp so that v * 1 MiB can never overflow size_t
+    constexpr long long kMaxMiB = static_cast<long long>(static_cast<unsigned long long>(-1) >> 20);
+    if (v > kMaxMiB) {
+        LOG_KNOWHERE_WARNING_ << "FL memory pool: clamping oversized " << name << "=\"" << raw << "\"";
+        v = kMaxMiB;
     }
     return v;
 }
@@ -41,13 +59,19 @@ ParseEnvMiB(const char* name) {
 
 const FlDeviceOps*
 GetDeviceOps() {
-    return g_ops;
+    return g_ops.load(std::memory_order_acquire);
 }
 
 void
 RegisterDeviceOps(const FlDeviceOps* ops) {
-    g_ops = ops;
-    FlMemoryPool::Instance().ConfigureFromEnv();
+    const bool had_ops = (g_ops.load(std::memory_order_acquire) != nullptr);
+    g_ops.store(ops, std::memory_order_release);
+    // Re-reading the env on adapter registration makes sense; re-reading it
+    // on UNregistration (ops == nullptr, a test-only path) would silently
+    // mutate pool limits without any device present, so skip that case.
+    if (ops != nullptr || !had_ops) {
+        FlMemoryPool::Instance().ConfigureFromEnv();
+    }
     LOG_KNOWHERE_INFO_ << "FL device ops registered, device_count="
                        << ((ops != nullptr && ops->device_count != nullptr) ? ops->device_count() : 0);
 }
@@ -83,12 +107,18 @@ FlMemoryPool::ConfigureFromEnv() {
 
 bool
 DeviceAvailable() {
-    if (g_ops == nullptr || g_ops->device_count == nullptr) {
+    const FlDeviceOps* ops = g_ops.load(std::memory_order_acquire);
+    if (ops == nullptr || ops->device_count == nullptr) {
         return false;
     }
-    const int count = g_ops->device_count();
+    const int count = ops->device_count();
     if (count < 1) {
-        LOG_KNOWHERE_INFO_ << "FL device not available (adapter registered but device_count=" << count << ")";
+        // TryStageToDevice() calls this on every Add/Deserialize; log once.
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_KNOWHERE_INFO_ << "FL device not available (adapter registered but device_count=" << count << ")";
+        }
         return false;
     }
     return true;
@@ -96,20 +126,36 @@ DeviceAvailable() {
 
 int
 DeviceCount() {
-    if (g_ops == nullptr || g_ops->device_count == nullptr) {
+    const FlDeviceOps* ops = g_ops.load(std::memory_order_acquire);
+    if (ops == nullptr || ops->device_count == nullptr) {
         return 0;
     }
-    return g_ops->device_count();
+    return ops->device_count();
 }
 
 void
 FlDeviceBuffer::reset() {
-    if (ptr_ != nullptr && g_ops != nullptr && g_ops->free != nullptr) {
-        g_ops->free(ptr_);
-        FlMemoryPool::Instance().TrackFree(bytes_);
+    if (ptr_ != nullptr) {
+        // Free through the function captured at construction so the buffer is
+        // always released by the same adapter that allocated it, even if the
+        // global ops table was re-registered (or cleared) in between.
+        if (free_fn_ != nullptr) {
+            free_fn_(ptr_);
+        } else {
+            // The adapter vanished without providing free(): releasing here
+            // could crash, so we intentionally leak and log instead.
+            LOG_KNOWHERE_ERROR_ << "FL device buffer leak: no free function captured (" << bytes_ << " bytes)";
+        }
+        // Only pool-tracked buffers are TrackFree'd; transient buffers were
+        // never TrackAlloc'd and must not touch the counter.
+        if (tracked_) {
+            FlMemoryPool::Instance().TrackFree(bytes_);
+        }
     }
     ptr_ = nullptr;
     bytes_ = 0;
+    free_fn_ = nullptr;
+    tracked_ = false;
 }
 
 }  // namespace fl

@@ -43,7 +43,9 @@
 namespace knowhere {
 
 // ---------------------------------------------------------------------------
-// FlIvfFlatIndexNode (GPU_IVF_FLAT / FL_IVF_FLAT on the FL path)
+// FlIvfFlatIndexNode (GPU_IVF_FLAT / FL_IVF_FLAT on the FL path).
+// One of Knowhere-FL's FL_* index nodes, built on the backend-neutral device
+// abstraction layer that accelerates vector search on diverse AI chips.
 //
 // v1 design (per plan, Phase 1.2/1.3 with the documented fallback):
 //   - Train: Lloyd kmeans. Assignment (mm+argmin, no atomics) runs on the

@@ -15,11 +15,13 @@
 namespace knowhere {
 namespace fl {
 
-// Registers a host-memory implementation of FlDeviceOps. "Device" buffers are
-// plain host allocations and kernels run on CPU (OpenMP). Purposes:
+// Host adapter: the CPU reference implementation of FlDeviceOps, one of the
+// per-chip adapters (src/common/fl/adapter/) that plug diverse AI chips into
+// Knowhere-FL without touching upstream Knowhere. "Device" buffers are plain
+// host allocations and kernels run on CPU (OpenMP). Purposes:
 //   1. Unit tests exercise the full FL device path without a GPU;
 //   2. CPU-only CI validates adapter/node contract end to end;
-//   3. Reference for chip adapter authors (PPU/Ascend/...) - each function
+//   3. Reference for chip adapter authors (PPU, Ascend, ...) - each function
 //      here is the semantic spec its device counterpart must match.
 // Returns false if another adapter is already registered.
 bool

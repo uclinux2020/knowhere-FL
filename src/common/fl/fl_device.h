@@ -21,14 +21,16 @@ namespace knowhere {
 namespace fl {
 
 // ---------------------------------------------------------------------------
-// Device abstraction layer for the FL (FlagOS) backend.
+// Knowhere-FL: a fork of Knowhere that accelerates vector search on diverse
+// AI chips through a backend-neutral device abstraction layer, built on top
+// of FlagOS (a unified open-source AI system software stack).
 //
-// Knowhere-FL never calls a chip runtime directly. All device interaction goes
-// through FlDeviceOps, a C-ABI function table implemented by a per-chip
-// adapter (e.g. the PPU adapter that wraps the validated FlagFit launch path:
-// HIDDEN_PARAM / hgLaunchKernelEx / device context binding). The adapter is
-// registered at process start (or lazily via RegisterPpuAdapter()) before any
-// FL index is built.
+// This file is the heart of that abstraction. Knowhere-FL never calls a chip
+// runtime directly. All device interaction goes through FlDeviceOps, a C-ABI
+// function table implemented by a per-chip adapter (e.g. the PPU adapter that
+// wraps the validated FlagFit launch path: HIDDEN_PARAM / hgLaunchKernelEx /
+// device context binding). The adapter is registered at process start (or
+// lazily via RegisterPpuAdapter()) before any FL index is built.
 //
 // Metric encoding for kernels: 0 = L2, 1 = IP. COSINE is intentionally not a
 // kernel metric; per design decision D4 it must be handled by normalizing

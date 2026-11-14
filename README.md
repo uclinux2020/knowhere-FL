@@ -1,11 +1,26 @@
 # Knowhere-FL
 
+**Knowhere-FL is a fork of [Knowhere](https://github.com/zilliztech/knowhere) that introduces a backend-neutral device abstraction layer (FL) for accelerating vector search on diverse AI chips, built on top of [FlagOS](https://github.com/flagos-ai), a unified open-source AI system software stack.**
+
 基于 [zilliztech/knowhere](https://github.com/zilliztech/knowhere) 的 fork，新增后端中立的 **FL（FlagOS）设备抽象层**与 4 个 FL_* 索引节点，用于在国产 GPU / PPU 上加速 Milvus 向量检索。
 
 - **设备抽象层**：`src/common/fl/`（FlDeviceOps 函数表 + 显存池 + RAII 缓冲 + 多卡路由 + host / ppu 适配器）
 - **索引节点**：`src/index/fl/`（FL_BRUTE_FORCE / FL_IVF_FLAT / FL_IVF_PQ / FL_CAGRA）
 - **微基准**：`python/fl_kernels/`；**单测**：`tests/ut/test_fl_index.cc`
 - **构建开关**：`WITH_FL`（设备后端）、`WITH_FL_PPU`（Zhenwu/ZW810E 芯片适配器）
+
+## 架构总览
+
+Knowhere-FL 沿用 FlagOS 生态 fork 项目的插件化叙事（参照 [Megatron-LM-FL](https://github.com/flagos-ai/Megatron-LM-FL) 的 `plugin/<vendor>/` 设计）：**上游 Knowhere 的检索接口与索引名不变**，只通过一个后端中立的设备抽象层接入多元 AI 芯片。
+
+| 层 | 位置 | 说明 |
+|---|---|---|
+| 设备抽象层（后端中立） | `src/common/fl/` | `FlDeviceOps` C-ABI 函数表 + 显存池 + RAII 缓冲 + 多卡路由 |
+| 芯片适配器（对应 `plugin/<vendor>/`） | `src/common/fl/adapter/` | `host_adapter`（CPU 参考实现）/ `ppu_adapter`（Zhenwu/ZW810E） |
+| 索引节点 | `src/index/fl/` | `FL_BRUTE_FORCE` / `FL_IVF_FLAT` / `FL_IVF_PQ` / `FL_CAGRA` |
+| 微基准 / 单测 | `python/fl_kernels/`、`tests/ut/` | 算子微基准 + 全链路单测 |
+
+接入新芯片只需实现一个 `FlDeviceOps` 适配器并注册——与 Megatron-LM-FL 的 `override_registry` 机制同构，主代码不感知具体芯片。
 
 > 下文正文为 FL 实施工作日志 + Milvus 集成指南。
 

@@ -41,7 +41,9 @@
 namespace knowhere {
 
 // ---------------------------------------------------------------------------
-// FlCagraIndexNode (FL_CAGRA) -- Phase 2.3 v1
+// FlCagraIndexNode (FL_CAGRA) -- Phase 2.3 v1.
+// One of Knowhere-FL's FL_* index nodes, built on the backend-neutral device
+// abstraction layer that accelerates vector search on diverse AI chips.
 //
 // v1 scope (per plan, with the documented adapt_for_cpu-style fallback):
 //   - Build: CPU brute-force kNN graph construction (O(nb^2 * dim)). For nb

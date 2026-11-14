@@ -43,7 +43,9 @@
 namespace knowhere {
 
 // ---------------------------------------------------------------------------
-// FlIvfPqIndexNode (GPU_IVF_PQ / FL_IVF_PQ on the FL path)
+// FlIvfPqIndexNode (GPU_IVF_PQ / FL_IVF_PQ on the FL path).
+// One of Knowhere-FL's FL_* index nodes, built on the backend-neutral device
+// abstraction layer that accelerates vector search on diverse AI chips.
 //
 // v1 design (plan Phase 2.1):
 //   - Train: CPU Lloyd kmeans for coarse centroids + per-subspace PQ

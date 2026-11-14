@@ -40,7 +40,9 @@
 namespace knowhere {
 
 // ---------------------------------------------------------------------------
-// FlBruteForceIndexNode (GPU_BRUTE_FORCE / FL_BRUTE_FORCE on the FL path)
+// FlBruteForceIndexNode (GPU_BRUTE_FORCE / FL_BRUTE_FORCE on the FL path).
+// One of Knowhere-FL's FL_* index nodes, built on the backend-neutral device
+// abstraction layer that accelerates vector search on diverse AI chips.
 //
 // Search strategy (design D5):
 //   1. If an FL device adapter is registered and the memory pool admits the

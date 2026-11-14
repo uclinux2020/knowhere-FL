@@ -10,10 +10,11 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
 // ---------------------------------------------------------------------------
-// PPU (Zhenwu/ZW810E) adapter for the FL backend. Implements FlDeviceOps on
-// top of the PPU runtime, reusing the launch path validated in the FlagFit
-// project (HIDDEN_PARAM ABI fix / hgLaunchKernelEx / HGlaunchConfig / device
-// context binding - the BUG-H resolution chain).
+// PPU adapter (Zhenwu/ZW810E): one of the per-chip adapters that plug diverse
+// AI chips into Knowhere-FL's backend-neutral device abstraction layer. It
+// implements FlDeviceOps on top of the PPU runtime, reusing the launch path
+// validated in the FlagFit project (HIDDEN_PARAM ABI fix / hgLaunchKernelEx /
+// HGlaunchConfig / device context binding - the BUG-H resolution chain).
 //
 // Retrieval kernels are FlagGems-composed Triton kernels AOT-compiled by
 // FlagTree for the PPU backend; this adapter loads the compiled artifacts and

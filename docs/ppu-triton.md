@@ -99,6 +99,12 @@ Search将临时设备缓冲合并为一次对齐arena分配，仍在请求结束
 较原布局改善1.49x。`KNOWHERE_FL_PPU_PROFILE=1`可单独测量score/selection事件区间，
 详见 [布局与事件定位报告](ppu-transpose-20261116.md)。配置不默认启用，未达端到端10x。
 
+## 预算受限query批次对齐
+
+对于可容纳完整query tile的非IVF/PQ分批请求，runtime将中间batch向下对齐到tile大小，
+减少masked lane重复计算。默认64MiB百万规模无显著变化；显式256MiB百万逆序配对改善约12%，
+详见 [批量对齐与退化实验报告](ppu-batch-alignment-20261116.md)。
+
 ## 独立真实设备测试（无完整 Conan graph）
 
 需 FlagTree PPU Python 和 nlohmann/json C++ 头文件（不需要 Torch 或 NumPy）。从仓库根目录执行：

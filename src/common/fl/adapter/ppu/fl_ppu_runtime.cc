@@ -315,7 +315,12 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             workspace_limit = mb << 20;
         }
         if (row_bytes > workspace_limit) throw std::runtime_error("PPU workspace budget cannot fit one query");
-        const int64_t batch = std::min<int64_t>(nq, workspace_limit / row_bytes);
+        int64_t batch = std::min<int64_t>(nq, workspace_limit / row_bytes);
+        // Avoid recomputing masked query lanes at every budget-limited batch
+        // boundary. Keep the final partial batch and single-query requests valid.
+        if (!ivf && !codes && batch < nq && batch >= bundle->queries_per_block) {
+            batch -= batch % bundle->queries_per_block;
+        }
         // One request-owned allocation avoids repeated HG allocator and
         // destructor synchronizations. No cross-request result/data caching.
         const size_t sizes[] = {

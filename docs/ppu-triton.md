@@ -92,6 +92,13 @@ Search将临时设备缓冲合并为一次对齐arena分配，仍在请求结束
 小请求真机计时改善约7%–27%，百万规模计算几乎不变；
 默认流/显式流回归及退化选择器实验见 [工作区优化报告](ppu-workspace-arena-20261116.md)。
 
+## 可选转置base布局和设备阶段计时
+
+`--transpose-base`每请求重新打包维度优先base，额外空间独立限制为1024MiB，
+不计入64MiB score预算；百万128维需额外512MB。query请求计入打包后约14.4ms，
+较原布局改善1.49x。`KNOWHERE_FL_PPU_PROFILE=1`可单独测量score/selection事件区间，
+详见 [布局与事件定位报告](ppu-transpose-20261116.md)。配置不默认启用，未达端到端10x。
+
 ## 独立真实设备测试（无完整 Conan graph）
 
 需 FlagTree PPU Python 和 nlohmann/json C++ 头文件（不需要 Torch 或 NumPy）。从仓库根目录执行：

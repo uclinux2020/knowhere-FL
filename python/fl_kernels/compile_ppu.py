@@ -22,6 +22,7 @@ def main():
     ap.add_argument('--ksub', type=int, default=256)
     ap.add_argument('--block', type=int, default=128)
     ap.add_argument('--select-block', type=int, default=1024)
+    ap.add_argument('--transpose-base', action='store_true', help='Request-owned coalesced matrix base layout')
     ap.add_argument('--num-warps', type=int, choices=[2, 4, 8], default=4)
     ap.add_argument('--implicit-ids', action='store_true', help='Eliminate brute-force score-table ID storage')
     ap.add_argument('--pq-lut', action='store_true', help='Reuse per-query PQ lookup tables')
@@ -53,6 +54,9 @@ def main():
     if not args.matrix and args.queries_per_block > 4:
         ap.error('direct distance configuration supports queries-per-block <= 4')
     from matrix_distance import matrix_distance_scores
+    from transpose_base import transpose_base
+    if args.transpose_base and not args.matrix:
+        ap.error('transpose-base requires matrix')
     from pq_lut import pq_lookup, pq_adc
     if args.pq_lut and args.m == 0:
         ap.error('pq-lut requires m > 0')
@@ -111,10 +115,11 @@ def main():
               'SCORES': '*fp32', 'IDS': '*i64', 'NB': 'i64', 'WIDTH': 'i64'},
              {'M': args.m, 'KSUB': args.ksub, 'METRIC': metric, 'BLOCK': args.block})
     if args.m == 0:
+        matrix_constants = {'TRANSPOSED': args.transpose_base} if args.matrix else {}
         emit('batched_distance', matrix_distance_scores if args.matrix else batched_distance_scores,
              {'XB': '*fp32', 'XQ': '*fp32', 'SCORES': '*fp32', 'IDS': '*i64', 'NB': 'i64', 'WIDTH': 'i64', 'NQ': 'i64'},
              {'DIM': args.dim, 'METRIC': metric, 'BLOCK': args.block, 'BD': triton.next_power_of_2(args.dim),
-              'QPB': args.queries_per_block, 'USE_TLE': args.tle, 'IMPLICIT_IDS': args.implicit_ids})
+              'QPB': args.queries_per_block, 'USE_TLE': args.tle, 'IMPLICIT_IDS': args.implicit_ids, **matrix_constants})
     if args.fused and args.m == 0 and args.k <= args.fused_block:
         fused_sig = {'XB': '*fp32', 'XQ': '*fp32', 'CAND': '*i64', 'OFFSETS': '*i64',
                      'OUT_SCORES': '*fp32', 'OUT_IDS': '*i64', 'NB': 'i64', 'WIDTH': 'i64', 'TILES': 'i64'}
@@ -122,11 +127,14 @@ def main():
             emit('fused_ivf' if ivf else 'fused_distance', fused_distance_topk, fused_sig,
                  {'DIM': args.dim, 'K': args.k, 'METRIC': metric, 'IVF': ivf, 'BLOCK': args.fused_block,
                   'BD': triton.next_power_of_2(args.dim), 'USE_TLE': args.tle})
+    if args.transpose_base:
+        emit('transpose_base', transpose_base, {'XB': '*fp32', 'PACKED': '*fp32', 'NB': 'i64'},
+             {'DIM': args.dim, 'BN': 32, 'BD': 32})
     manifest = {'schema': 1, 'backend': 'flagtree-ppu', 'implementation': 'triton-tle' if args.tle else 'triton',
                 'dim': args.dim, 'k': args.k, 'metric': metric, 'm': args.m,
                 'ksub': args.ksub, 'block': args.block, 'select_block': args.select_block, 'fused_block': args.fused_block,
                 'kernels': entries, 'queries_per_block': args.queries_per_block,
-                'implicit_ids': args.implicit_ids,
+                'implicit_ids': args.implicit_ids, 'transpose_base': args.transpose_base,
                 'distance_implementation': 'matrix-ieee-fp32' if args.matrix else 'direct-fp32'}
     # Publish the manifest last so partially built bundles cannot be used.
     (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

@@ -349,10 +349,45 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             if (offsets[nq]) Check(hgMemcpyHtoD(candidate_buffer.ptr, candidates, offsets[nq] * sizeof(int64_t)));
             Check(hgMemcpyHtoD(offset_buffer.ptr, offsets, (nq + 1) * sizeof(int64_t)));
         }
+        std::unique_ptr<Buffer> packed;
+        HGdeviceptr search_vectors = Ptr(xb);
+        if (!ivf && !codes && bundle->kernels.count("transpose_base")) {
+            const uint64_t max_elements = std::numeric_limits<size_t>::max() / sizeof(float);
+            if (static_cast<uint64_t>(nb) > max_elements / static_cast<uint64_t>(dim)) {
+                throw std::runtime_error("PPU packed base size overflow");
+            }
+            const size_t packed_bytes = static_cast<size_t>(nb) * static_cast<size_t>(dim) * sizeof(float);
+            // Packing is opt-in and has a separate hard cap; do not conceal
+            // this extra allocation behind the score-workspace budget.
+            if (packed_bytes > (1024ULL << 20)) throw std::runtime_error("PPU packed base exceeds 1024 MiB cap");
+            packed = std::make_unique<Buffer>(packed_bytes, stream);
+            HGdeviceptr source = Ptr(xb), output = packed->ptr;
+            bundle->Get("transpose_base").Launch({&source, &output, &nb},
+                                                 static_cast<unsigned>((dim + 31) / 32), stream,
+                                                 static_cast<unsigned>((nb + 31) / 32));
+            search_vectors = packed->ptr;
+        }
+        const bool profile = std::getenv("KNOWHERE_FL_PPU_PROFILE") != nullptr;
+        struct Events {
+            HGevent begin = nullptr, scored = nullptr, selected = nullptr;
+            explicit Events(bool enabled) {
+                if (!enabled) return;
+                Check(hgEventCreate(&begin, 0));
+                try { Check(hgEventCreate(&scored, 0)); Check(hgEventCreate(&selected, 0)); }
+                catch (...) { if (scored) hgEventDestroy(scored); hgEventDestroy(begin); throw; }
+            }
+            ~Events() {
+                if (selected) hgEventDestroy(selected);
+                if (scored) hgEventDestroy(scored);
+                if (begin) hgEventDestroy(begin);
+            }
+        } events(profile);
+        double score_ms = 0, select_ms = 0;
         for (int64_t q = 0; q < nq; q += batch) {
+            if (profile) Check(hgEventRecord(events.begin, stream));
             unsigned query_count = static_cast<unsigned>(std::min(batch, nq - q));
             HGdeviceptr query_ptr = Ptr(xq) + q * dim * sizeof(float);
-            HGdeviceptr vectors = Ptr(xb), encoded_codes = Ptr(codes);
+            HGdeviceptr vectors = search_vectors, encoded_codes = Ptr(codes);
             HGdeviceptr off_ptr = offset_buffer.ptr + (ivf ? q * sizeof(int64_t) : 0);
             int64_t base = 0;
             unsigned score_grid = static_cast<unsigned>((width + bundle->block - 1) / bundle->block);
@@ -379,6 +414,7 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
                     {&vectors, &query_ptr, &candidate_buffer.ptr, &off_ptr, &scores.ptr, &members.ptr, &nb, &width, &base},
                     score_grid, stream, query_count);
             }
+            if (profile) Check(hgEventRecord(events.scored, stream));
             HGdeviceptr in_score = fused ? compact_a.ptr : scores.ptr;
             HGdeviceptr in_ids = fused ? ids_a.ptr : members.ptr;
             HGdeviceptr out_score = fused ? compact_b.ptr : compact_a.ptr;
@@ -398,10 +434,18 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
                 out_score = use_a ? compact_a.ptr : compact_b.ptr;
                 out_ids = use_a ? ids_a.ptr : ids_b.ptr;
             }
+            if (profile) Check(hgEventRecord(events.selected, stream));
             Check(hgStreamSynchronize(stream));
+            if (profile) {
+                float elapsed = 0;
+                Check(hgEventElapsedTime(&elapsed, events.begin, events.scored)); score_ms += elapsed;
+                Check(hgEventElapsedTime(&elapsed, events.scored, events.selected)); select_ms += elapsed;
+            }
             Check(hgMemcpyDtoH(distances + q * k, out_score, query_count * k * sizeof(float)));
             Check(hgMemcpyDtoH(ids + q * k, out_ids, query_count * k * sizeof(int64_t)));
         }
+        if (profile) std::cerr << "PPU_PROFILE score_ms=" << score_ms << " select_ms=" << select_ms
+                               << " query_batch=" << batch << '\n';
         return 0;
     } catch (const std::exception& e) {
         // Never free workspace while a failed launch chain may still use it.

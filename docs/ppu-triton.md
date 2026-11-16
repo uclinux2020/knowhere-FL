@@ -78,6 +78,14 @@ export KNOWHERE_FL_PPU_KERNEL_DIR="$PWD/build/ppu-kernels"
 预算、数值和完整样本见 [PQ查表复用优化](ppu-pq-lut-20261116.md)。
 旧manifest仍走直接计算，不使用设备地址缓存LUT。
 
+## 可选 brute-force 隐式 ID 配置
+
+`--implicit-ids`取消完整score表的重复int64 ID存储，第一层选择由列位置恢复ID。
+配合矩阵w2/block32/select2048，在默认64MiB预算下百万向量query请求实测21.4ms，
+历史CUDA-C约52.2ms（2.44x），未达10x。更宽全输入传输边界仅1.53x；
+详见 [隐式ID及端到端边界报告](ppu-implicit-id-20261116.md)。
+IVF/PQ候选不使用隐式ID，旧manifest仍兼容。
+
 ## 独立真实设备测试（无完整 Conan graph）
 
 需 FlagTree PPU Python 和 nlohmann/json C++ 头文件（不需要 Torch 或 NumPy）。从仓库根目录执行：

@@ -86,13 +86,16 @@ def pq_scores(CB, CODES, XQ, CAND, OFFSETS, SCORES, IDS,
 @triton.jit
 def select_topk(SCORES, IDS, OUT_SCORES, OUT_IDS,
                 WIDTH, K: tl.constexpr, TILES,
-                METRIC: tl.constexpr, BLOCK: tl.constexpr):
+                METRIC: tl.constexpr, BLOCK: tl.constexpr, IMPLICIT_IDS: tl.constexpr = False):
     query = tl.program_id(0)
     tile = tl.program_id(1)
     pos = tile * BLOCK + tl.arange(0, BLOCK)
     worst: tl.constexpr = float('inf') if METRIC == 0 else -float('inf')
     scores = tl.load(SCORES + query * WIDTH + pos, pos < WIDTH, other=worst)
-    ids = tl.load(IDS + query * WIDTH + pos, pos < WIDTH, other=-1)
+    if IMPLICIT_IDS:
+        ids = tl.where(pos < WIDTH, pos.to(tl.int64), -1)
+    else:
+        ids = tl.load(IDS + query * WIDTH + pos, pos < WIDTH, other=-1)
     for rank in range(K):
         eligible = ids >= 0
         candidate = tl.where(eligible, scores, worst)

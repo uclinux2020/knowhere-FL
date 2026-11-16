@@ -134,6 +134,7 @@ struct Kernel {
 };
 struct Bundle {
     int64_t dim, k, m, ksub, block, select_block, fused_block, queries_per_block;
+    bool implicit_ids = false;
     int metric;
     std::unordered_map<std::string, std::unique_ptr<Kernel>> kernels;
     explicit Bundle(const std::filesystem::path& root) {
@@ -149,6 +150,7 @@ struct Bundle {
         block = meta.at("block"); select_block = meta.at("select_block");
         fused_block = meta.value("fused_block", 256);
         queries_per_block = meta.value("queries_per_block", 1);
+        implicit_ids = meta.value("implicit_ids", false);
         if (dim <= 0 || k <= 0 || 2 * k > select_block || select_block > 65536 || block <= 0 ||
             (block & (block - 1)) || (select_block & (select_block - 1)) || (metric != 0 && metric != 1) ||
             (queries_per_block != 1 && queries_per_block != 2 && queries_per_block != 4 &&
@@ -290,13 +292,18 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             return 0;
         }
         if (width > 65535 * bundle->block) throw std::runtime_error("PPU score grid exceeds supported width");
+        const bool implicit = !ivf && !codes && bundle->implicit_ids;
+        if (implicit && (!bundle->kernels.count("select_implicit") || !bundle->kernels.count("batched_distance"))) {
+            throw std::runtime_error("Incomplete implicit ID kernel bundle");
+        }
         const bool use_lut = codes && bundle->kernels.count("pq_lut") && bundle->kernels.count("pq_adc");
         const std::string fused_name = ivf ? "fused_ivf" : "fused_distance";
         const bool fused = !codes && bundle->kernels.count(fused_name) != 0;
         const int64_t local_block = fused ? bundle->fused_block : bundle->select_block;
         const int64_t tiles = (width + local_block - 1) / local_block;
         const int64_t compact_width = tiles * k;
-        const uint64_t row_bytes = static_cast<uint64_t>((fused ? 0 : width) + 2 * compact_width) * 12 +
+        const uint64_t row_bytes = (fused ? 0 : static_cast<uint64_t>(width) * (implicit ? 4 : 12)) +
+                                   static_cast<uint64_t>(2 * compact_width) * 12 +
                                    (use_lut ? static_cast<uint64_t>(m * ksub) * sizeof(float) : 0);
         uint64_t workspace_limit = 64ULL << 20;
         if (const char* raw = std::getenv("KNOWHERE_FL_PPU_WORKSPACE_MB")) {
@@ -313,7 +320,7 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
         Buffer offset_buffer(ivf ? (nq + 1) * sizeof(int64_t) : 1, stream);
         Buffer lookup(use_lut ? batch * m * ksub * sizeof(float) : 1, stream);
         Buffer scores(fused ? 1 : batch * width * sizeof(float), stream);
-        Buffer members(fused ? 1 : batch * width * sizeof(int64_t), stream);
+        Buffer members(fused || implicit ? 1 : batch * width * sizeof(int64_t), stream);
         Buffer compact_a(batch * compact_width * sizeof(float), stream);
         Buffer ids_a(batch * compact_width * sizeof(int64_t), stream);
         Buffer compact_b(batch * compact_width * sizeof(float), stream);
@@ -358,10 +365,12 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             HGdeviceptr out_ids = fused ? ids_b.ptr : ids_a.ptr;
             int64_t input_width = fused ? compact_width : width;
             bool use_a = !fused;
+            bool first_level = true;
             while (true) {
                 int64_t level_tiles = (input_width + bundle->select_block - 1) / bundle->select_block;
-                bundle->Get("select").Launch({&in_score, &in_ids, &out_score, &out_ids, &input_width, &level_tiles},
+                bundle->Get(implicit && first_level ? "select_implicit" : "select").Launch({&in_score, &in_ids, &out_score, &out_ids, &input_width, &level_tiles},
                                              static_cast<unsigned>(level_tiles), stream, query_count);
+                first_level = false;
                 if (level_tiles == 1) break;
                 input_width = level_tiles * k;
                 in_score = out_score; in_ids = out_ids;

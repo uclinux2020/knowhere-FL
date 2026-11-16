@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <queue>
 #include <random>
@@ -188,10 +189,29 @@ int main(int argc, char** argv) {
             Require(hgModuleLoad(&legacy_module, legacy_path) == HGGC_SUCCESS, "Legacy artifact load failed");
             Require(hgModuleGetFunction(&legacy_function, legacy_module, "brute_force_topk") == HGGC_SUCCESS, "Legacy function missing");
         }
+        const bool full_input_e2e = std::getenv("KNOWHERE_PPU_FULL_INPUT_E2E") != nullptr;
+        const bool query_e2e = full_input_e2e || std::getenv("KNOWHERE_PPU_QUERY_E2E") != nullptr;
         auto search = [&] {
+            std::unique_ptr<Buffer> staged_base;
+            void* active_base = base.ptr;
+            if (full_input_e2e) {
+                Require(mode == "bf", "full-input E2E currently supports brute-force only");
+                staged_base = std::make_unique<Buffer>(base_host.size() * sizeof(float));
+                Require(ppu::CopyH2D(staged_base->ptr, base_host.data(), base_host.size() * sizeof(float), stream.ptr) == 0,
+                        "per-request index H2D failed");
+                active_base = staged_base->ptr;
+            }
+            std::unique_ptr<Buffer> staged_query;
+            void* active_query = query.ptr;
+            if (query_e2e) {
+                staged_query = std::make_unique<Buffer>(queries.size() * sizeof(float));
+                Require(ppu::CopyH2D(staged_query->ptr, queries.data(), queries.size() * sizeof(float), stream.ptr) == 0,
+                        "per-request query H2D failed");
+                active_query = staged_query->ptr;
+            }
             int status;
             if (legacy_path) {
-                HGdeviceptr xb_ptr = reinterpret_cast<uintptr_t>(base.ptr), xq_ptr = reinterpret_cast<uintptr_t>(query.ptr);
+                HGdeviceptr xb_ptr = reinterpret_cast<uintptr_t>(active_base), xq_ptr = reinterpret_cast<uintptr_t>(active_query);
                 HGdeviceptr od = reinterpret_cast<uintptr_t>(legacy_scores.ptr), oi = reinterpret_cast<uintptr_t>(legacy_ids.ptr), scratch = 0;
                 void* params[] = {&xb_ptr, &nb, &xq_ptr, &nq, &dim, &k, &metric, &od, &oi, &scratch};
                 HGlaunchConfig config{};
@@ -205,10 +225,10 @@ int main(int argc, char** argv) {
                 return;
             }
             if (mode == "assign") {
-                status = ppu::Assign(query.ptr, nq, dim, base.ptr, nb, metric, actual.ids.data(), stream.ptr);
+                status = ppu::Assign(active_query, nq, dim, base.ptr, nb, metric, actual.ids.data(), stream.ptr);
                 // Assign returns IDs only. Gather reference scores outside timed region below.
             } else {
-                status = ppu::Search(base.ptr, nb, query.ptr, nq, dim, k, metric,
+                status = ppu::Search(active_base, nb, active_query, nq, dim, k, metric,
                                     offsets.empty() ? nullptr : cand.data(), offsets.empty() ? nullptr : offsets.data(),
                                     actual.scores.data(), actual.ids.data(), stream.ptr,
                                     codes.empty() ? nullptr : encoded.ptr, m, ksub, m ? dim / m : 0);
@@ -239,7 +259,9 @@ int main(int argc, char** argv) {
                        {"correctness", correctness}, {"process_lifetime_peak_rss_kib", usage.ru_maxrss},
                        {"input_device_bytes", base_host.size() * sizeof(float) + queries.size() * sizeof(float) + codes.size()},
                        {"host_candidate_bytes", cand.size() * sizeof(int64_t) + offsets.size() * sizeof(int64_t)},
-                       {"timing_boundary", "resident base/query; includes runtime workspace alloc/free, candidate H2D, all launches/syncs, result D2H; excludes initial base/query H2D and AOT compilation"},
+                       {"full_input_e2e", full_input_e2e},
+                       {"query_request_e2e", query_e2e},
+                       {"timing_boundary", full_input_e2e ? "includes per-request base/query allocation, H2D, Search, result D2H and free; excludes AOT, module cold load, input generation and service overhead" : query_e2e ? "resident index; includes per-request query allocation/H2D/free, runtime workspace, all launches/syncs and result D2H; excludes initial index staging, AOT and service overhead" : "resident base/query; includes runtime workspace alloc/free, candidate H2D, all launches/syncs, result D2H; excludes initial base/query H2D and AOT compilation"},
                        {"cpu_baseline", "independent direct FP32 distance + deterministic heap, OpenMP/SIMD; PQ uses decoded vectors, NOT a CPU LUT-ADC implementation; NOT Knowhere/Faiss index"}};
         std::ofstream file(output); Require(file.good(), "Cannot open report output"); file << report.dump(2) << '\n';
         std::cout << report.dump() << '\n';

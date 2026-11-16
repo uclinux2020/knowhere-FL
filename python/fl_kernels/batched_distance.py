@@ -12,7 +12,7 @@ from retrieval_triton import vector_load
 def batched_distance_scores(XB, XQ, SCORES, IDS, NB, WIDTH, NQ,
                             DIM: tl.constexpr, METRIC: tl.constexpr,
                             BLOCK: tl.constexpr, BD: tl.constexpr,
-                            QPB: tl.constexpr, USE_TLE: tl.constexpr):
+                            QPB: tl.constexpr, USE_TLE: tl.constexpr, IMPLICIT_IDS: tl.constexpr = False):
     group = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     d = tl.arange(0, BD)
@@ -32,5 +32,6 @@ def batched_distance_scores(XB, XQ, SCORES, IDS, NB, WIDTH, NQ,
             score = tl.sum(b * q[None, :], 1)
         tl.store(SCORES + query * WIDTH + col, tl.where(valid, score, worst),
                  (query < NQ) & (col < WIDTH))
-        tl.store(IDS + query * WIDTH + col, tl.where(valid, col.to(tl.int64), -1),
-                 (query < NQ) & (col < WIDTH))
+        if not IMPLICIT_IDS:
+            tl.store(IDS + query * WIDTH + col, tl.where(valid, col.to(tl.int64), -1),
+                     (query < NQ) & (col < WIDTH))

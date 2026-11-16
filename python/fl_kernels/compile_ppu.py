@@ -22,6 +22,8 @@ def main():
     ap.add_argument('--ksub', type=int, default=256)
     ap.add_argument('--block', type=int, default=128)
     ap.add_argument('--select-block', type=int, default=1024)
+    ap.add_argument('--num-warps', type=int, choices=[2, 4, 8], default=4)
+    ap.add_argument('--implicit-ids', action='store_true', help='Eliminate brute-force score-table ID storage')
     ap.add_argument('--pq-lut', action='store_true', help='Reuse per-query PQ lookup tables')
     ap.add_argument('--matrix', action='store_true', help='Opt-in IEEE FP32 matrix distance configuration')
     ap.add_argument('--queries-per-block', type=int, choices=[1, 2, 4, 16, 32], default=4)
@@ -63,7 +65,7 @@ def main():
     def emit(name, fn, signature, constants):
         source = ASTSource(fn, signature, constants)
         kernel = triton.compile(source, target=GPUTarget('cuda', 80, 32),
-                                options={'num_warps': 4, 'num_stages': 3})
+                                options={'num_warps': args.num_warps, 'num_stages': 3})
         binary = kernel.asm.get('hgbin')
         if not isinstance(binary, bytes):
             raise RuntimeError('FlagTree did not emit PPU hgbin; refusing a non-PPU artifact')
@@ -87,6 +89,11 @@ def main():
                'OUT_IDS': '*i64', 'WIDTH': 'i64', 'TILES': 'i64'}
     emit('select', select_topk, sel_sig,
          {'K': args.k, 'METRIC': metric, 'BLOCK': args.select_block})
+    if args.implicit_ids:
+        if args.m != 0 or args.fused:
+            ap.error('implicit-ids requires non-PQ, non-fused distance')
+        emit('select_implicit', select_topk, sel_sig,
+             {'K': args.k, 'METRIC': metric, 'BLOCK': args.select_block, 'IMPLICIT_IDS': True})
     if args.m:
         sig = {'CB': '*fp32', 'CODES': '*u8', 'XQ': '*fp32', 'CAND': '*i64',
                'OFFSETS': '*i64', 'SCORES': '*fp32', 'IDS': '*i64', 'NB': 'i64', 'WIDTH': 'i64', 'BASE': 'i64'}
@@ -107,7 +114,7 @@ def main():
         emit('batched_distance', matrix_distance_scores if args.matrix else batched_distance_scores,
              {'XB': '*fp32', 'XQ': '*fp32', 'SCORES': '*fp32', 'IDS': '*i64', 'NB': 'i64', 'WIDTH': 'i64', 'NQ': 'i64'},
              {'DIM': args.dim, 'METRIC': metric, 'BLOCK': args.block, 'BD': triton.next_power_of_2(args.dim),
-              'QPB': args.queries_per_block, 'USE_TLE': args.tle})
+              'QPB': args.queries_per_block, 'USE_TLE': args.tle, 'IMPLICIT_IDS': args.implicit_ids})
     if args.fused and args.m == 0 and args.k <= args.fused_block:
         fused_sig = {'XB': '*fp32', 'XQ': '*fp32', 'CAND': '*i64', 'OFFSETS': '*i64',
                      'OUT_SCORES': '*fp32', 'OUT_IDS': '*i64', 'NB': 'i64', 'WIDTH': 'i64', 'TILES': 'i64'}
@@ -119,6 +126,7 @@ def main():
                 'dim': args.dim, 'k': args.k, 'metric': metric, 'm': args.m,
                 'ksub': args.ksub, 'block': args.block, 'select_block': args.select_block, 'fused_block': args.fused_block,
                 'kernels': entries, 'queries_per_block': args.queries_per_block,
+                'implicit_ids': args.implicit_ids,
                 'distance_implementation': 'matrix-ieee-fp32' if args.matrix else 'direct-fp32'}
     # Publish the manifest last so partially built bundles cannot be used.
     (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

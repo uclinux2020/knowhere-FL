@@ -12,7 +12,7 @@ from retrieval_triton import vector_load
 def matrix_distance_scores(XB, XQ, SCORES, IDS, NB, WIDTH, NQ,
                            DIM: tl.constexpr, METRIC: tl.constexpr,
                            BLOCK: tl.constexpr, BD: tl.constexpr,
-                           QPB: tl.constexpr, USE_TLE: tl.constexpr):
+                           QPB: tl.constexpr, USE_TLE: tl.constexpr, IMPLICIT_IDS: tl.constexpr = False):
     rows = tl.program_id(0) * QPB + tl.arange(0, QPB)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     d = tl.arange(0, BD)
@@ -37,5 +37,6 @@ def matrix_distance_scores(XB, XQ, SCORES, IDS, NB, WIDTH, NQ,
         score = cross
     mask = (rows[:, None] < NQ) & (cols[None, :] < WIDTH)
     tl.store(SCORES + rows[:, None] * WIDTH + cols[None, :], score, mask)
-    tl.store(IDS + rows[:, None] * WIDTH + cols[None, :],
-             tl.broadcast_to(cols[None, :].to(tl.int64), (QPB, BLOCK)), mask)
+    if not IMPLICIT_IDS:
+        tl.store(IDS + rows[:, None] * WIDTH + cols[None, :],
+                 tl.broadcast_to(cols[None, :].to(tl.int64), (QPB, BLOCK)), mask)

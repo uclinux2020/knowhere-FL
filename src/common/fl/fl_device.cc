@@ -59,6 +59,14 @@ ParseEnvMiB(const char* name) {
 
 const FlDeviceOps*
 GetDeviceOps() {
+#ifdef KNOWHERE_FL_WITH_PPU
+    static std::once_flag initialized;
+    std::call_once(initialized, [] {
+        if (g_ops.load(std::memory_order_acquire) == nullptr) {
+            RegisterPpuAdapter();
+        }
+    });
+#endif
     return g_ops.load(std::memory_order_acquire);
 }
 
@@ -107,7 +115,7 @@ FlMemoryPool::ConfigureFromEnv() {
 
 bool
 DeviceAvailable() {
-    const FlDeviceOps* ops = g_ops.load(std::memory_order_acquire);
+    const FlDeviceOps* ops = GetDeviceOps();
     if (ops == nullptr || ops->device_count == nullptr) {
         return false;
     }
@@ -126,7 +134,7 @@ DeviceAvailable() {
 
 int
 DeviceCount() {
-    const FlDeviceOps* ops = g_ops.load(std::memory_order_acquire);
+    const FlDeviceOps* ops = GetDeviceOps();
     if (ops == nullptr || ops->device_count == nullptr) {
         return 0;
     }

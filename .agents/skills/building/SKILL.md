@@ -27,6 +27,8 @@ Build options and output paths are defined in [Makefile](../../../Makefile) and
 | CPU Release | `make` |
 | CPU Debug | `make WITH_DEBUG=True` |
 | CPU + UT | `make WITH_UT=True` |
+| FlagOS CPU fallback + UT | `make WITH_FL=True WITH_UT=True WITH_DISKANN=False` |
+| FlagOS native PPU + UT | `PPU_SDK_PATH=/usr/local/PPU_SDK make WITH_FL=True WITH_FL_PPU=True WITH_UT=True WITH_DISKANN=False` |
 | CPU + UT + ASAN | `make WITH_UT=True WITH_ASAN=True` |
 | Cardinal GPU | `make WITH_CARDINAL=True WITH_GPU=True` |
 | Cardinal CPU only | `make WITH_CARDINAL=True` |
@@ -67,6 +69,11 @@ leave them unset to disable them; `WITH_UT=False`, for example, still enables te
 
 `WITH_CUVS=True` enables cuVS independently of `WITH_GPU`. Without Cardinal, `WITH_GPU=True`
 still enables cuVS even when `WITH_CUVS=False`.
+
+For the PPU backend, see [the native Triton/Triton-TLE guide](../../../docs/ppu-triton.md)
+for offline bundles and standalone real-device tests. The C++ backend links native
+`hggc`, not PyTorch or CUDA. A standalone PPU test does not validate the complete
+Knowhere library or replace the Catch2 FL tests.
 
 ## Common Issues
 

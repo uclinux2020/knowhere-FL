@@ -27,6 +27,13 @@ For Debug builds, use `build/Debug/tests/ut/knowhere_tests`. For a custom output
 `BUILD_DIR` to `make test` or adjust the executable path. Available tests depend on the build options;
 check `--list-tests` before selecting a filter.
 
+## PPU Triton/Triton-TLE tests
+
+The [PPU guide](../../../docs/ppu-triton.md) documents `tests/ppu/` and
+`python/fl_kernels/test_retrieval_triton.py`. These compile offline bundles and
+execute native HG kernels on a real PPU without PyTorch/NumPy or CPU fallback.
+They are separate from the full Catch2 library build; report both boundaries.
+
 ## Catch2 Quick Reference
 
 | Command | Description |

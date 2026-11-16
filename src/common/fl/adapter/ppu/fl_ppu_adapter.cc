@@ -1,167 +1,44 @@
 // Copyright (C) 2026 knowhere-FL contributors.
-//
-// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
-// with the License. You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software distributed under the License
-// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
-// or implied. See the License for the specific language governing permissions and limitations under the License.
-
-// ---------------------------------------------------------------------------
-// PPU adapter (Zhenwu/ZW810E): one of the per-chip adapters that plug diverse
-// AI chips into knowhere-FL's backend-neutral device abstraction layer. It
-// implements FlDeviceOps on top of the PPU runtime, reusing the launch path
-// validated in the FlagFit project (HIDDEN_PARAM ABI fix / hgLaunchKernelEx /
-// HGlaunchConfig / device context binding - the BUG-H resolution chain).
-//
-// Retrieval kernels are FlagGems-composed Triton kernels AOT-compiled by
-// FlagTree for the PPU backend; this adapter loads the compiled artifacts and
-// launches them through the FlagFit launch wrapper.
-//
-// This file only compiles when the PPU SDK is available:
-//   cmake .. -DWITH_FL=ON -DWITH_FL_PPU=ON -DPPU_SDK_PATH=/opt/ppu
-// Without the SDK the file compiles to an empty TU so the rest of the FL
-// backend stays buildable everywhere.
-// ---------------------------------------------------------------------------
-
+// Licensed under the Apache License, Version 2.0.
+// Native HG host adapter for FlagTree AOT Triton/Triton-TLE retrieval kernels.
+// No CUDA-C device code, ATen, PyTorch, or speculative hgAot wrapper ABI.
 #include "common/fl/fl_device.h"
 
 #ifdef KNOWHERE_FL_WITH_PPU
-
-#include <cstdlib>
-#include <cstring>
-
+#include "common/fl/adapter/ppu/fl_ppu_runtime.h"
 #include "knowhere/log.h"
 
-// Integration points to the FlagFit launch wrapper (see README-FL.md).
-// The wrapper owns: device context binding, HGlaunchConfig construction,
-// HIDDEN_PARAM injection, hgLaunchKernelEx invocation.
-// TODO(PPU): replace these forward decls with the real FlagFit headers when
-// integrating on the PPU dev box.
-extern "C" {
-int hgDeviceCount();
-int hgSetDevice(int device_id);
-int hgDeviceSynchronize();
-void* hgMemAlloc(size_t bytes);
-int hgMemFree(void* ptr);
-int hgMemcpyH2D(void* dst, const void* src, size_t bytes, void* stream);
-int hgMemcpyD2H(void* dst, const void* src, size_t bytes, void* stream);
-int hgMemcpyD2D(void* dst, const void* src, size_t bytes, void* stream);
-void* hgStreamCreate();
-int hgStreamDestroy(void* stream);
-int hgStreamSynchronize(void* stream);
-// AOT kernel registry produced by the FlagTree build step (fl_kernels.json):
-// loads a compiled FlagGems-composition kernel by name.
-void* hgAotKernelLoad(const char* name, const char* artifact_path);
-int hgAotLaunchTopK(const void* kernel, const void* xb, long nb, const void* xq, long nq, long dim, long k,
-                    int metric, float* out_dist, long* out_ids, void* stream);
-}
-
-namespace knowhere {
-namespace fl {
+namespace knowhere::fl {
 namespace {
-
-// TODO(PPU): artifact locations come from the FlagTree AOT build; wire into
-// milvus.yaml-adjacent config once the kernel set stabilizes (Phase 1).
-constexpr const char* kBruteForceTopKArtifact = "fl_kernels/brute_force_topk.ppuo";
-constexpr const char* kKmeansAssignArtifact = "fl_kernels/kmeans_assign.ppuo";
-constexpr const char* kIvfPqScanArtifact = "fl_kernels/ivf_pq_scan.ppuo";
-constexpr const char* kGraphSearchArtifact = "fl_kernels/graph_search.ppuo";
-
-int
-ppu_brute_force_topk(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int64_t k, int metric,
-                     float* out_dist, int64_t* out_ids, void* stream) {
-    static void* kernel = hgAotKernelLoad("brute_force_topk", kBruteForceTopKArtifact);
-    if (kernel == nullptr) {
-        LOG_KNOWHERE_ERROR_ << "PPU adapter: brute_force_topk kernel not loaded";
-        return -1;
-    }
-    return hgAotLaunchTopK(kernel, xb, nb, xq, nq, dim, k, metric, out_dist, out_ids, stream);
+int TopK(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int64_t k, int metric,
+         float* distances, int64_t* ids, void* stream) {
+    return ppu::Search(xb, nb, xq, nq, dim, k, metric, nullptr, nullptr, distances, ids, stream);
 }
-
-int
-ppu_ivf_flat_scan(const void* xb, int64_t nb, int64_t dim, const void* xq, int64_t nq, const int64_t* cand_ids,
-                  const int64_t* cand_offsets, int64_t k, int metric, float* out_dist, int64_t* out_ids,
-                  void* stream) {
-    // TODO(PPU): upload cand_ids/cand_offsets (H2D), then launch the
-    // gather+distance+topk kernel. Until ivf_scan lands (Phase 1.3), return
-    // -1 so the caller falls back to the CPU scan path (design D5).
-    (void)xb; (void)nb; (void)dim; (void)xq; (void)nq;
-    (void)cand_ids; (void)cand_offsets; (void)k; (void)metric;
-    (void)out_dist; (void)out_ids; (void)stream;
-    return -1;
+int IvfFlat(const void* xb, int64_t nb, int64_t dim, const void* xq, int64_t nq, const int64_t* candidates,
+            const int64_t* offsets, int64_t k, int metric, float* distances, int64_t* ids, void* stream) {
+    if (!offsets) return -1;
+    return ppu::Search(xb, nb, xq, nq, dim, k, metric, candidates, offsets, distances, ids, stream);
 }
-
-int
-ppu_kmeans_assign(const void* xb, int64_t nb, int64_t dim, const void* centroids, int64_t nlist, int metric,
-                  int64_t* assign, void* stream) {
-    // TODO(PPU): load the FlagTree AOT artifact of the FlagGems mm+argmin
-    // composition (see python/fl_kernels/kmeans_composition.py --emit) and
-    // launch it here via hgAotLaunchAssign. Until wired (Phase 1.2), return
-    // -1 so Train/Add fall back to CPU routing (design D5).
-    (void)xb; (void)nb; (void)dim; (void)centroids; (void)nlist; (void)metric;
-    (void)assign; (void)stream;
-    (void)kKmeansAssignArtifact;
-    return -1;
+int IvfPq(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, const void* codes, int64_t nb,
+          const void* xq, int64_t nq, int64_t dim, const int64_t* candidates, const int64_t* offsets,
+          int64_t k, int metric, float* distances, int64_t* ids, void* stream) {
+    if (!codes || !offsets) return -1;
+    return ppu::Search(codebooks, nb, xq, nq, dim, k, metric, candidates, offsets, distances, ids, stream,
+                       codes, m, ksub, dsub);
 }
-
-int
-ppu_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, const void* codes, int64_t nb,
-                const void* xq, int64_t nq, int64_t dim, const int64_t* cand_ids, const int64_t* cand_offsets,
-                int64_t k, int metric, float* out_dist, int64_t* out_ids, void* stream) {
-    // TODO(PPU): upload cand lists, compute per-query LUTs via the FlagGems mm
-    // composition against reshaped codebooks, then launch the ADC scan kernel
-    // (KernelGen baseline -> FlagGems contribution, Phase 2). Until wired,
-    // return -1 so the caller falls back to the CPU ADC path (design D5).
-    (void)codebooks; (void)m; (void)ksub; (void)dsub; (void)codes; (void)nb;
-    (void)xq; (void)nq; (void)dim; (void)cand_ids; (void)cand_offsets;
-    (void)k; (void)metric; (void)out_dist; (void)out_ids; (void)stream;
-    (void)kIvfPqScanArtifact;
-    return -1;
-}
-
-int
-ppu_graph_search(const void* xb, int64_t nb, int64_t dim, const int64_t* graph_ids, const int64_t* graph_offsets,
-                 int64_t max_degree, const void* xq, int64_t nq, int64_t k, int64_t itopk, int metric,
-                 float* out_dist, int64_t* out_ids, void* stream) {
-    // TODO(PPU): upload the graph CSR, launch the greedy traversal kernel.
-    // Graph traversal is the highest-risk kernel in the plan (irregular
-    // control flow, small per-step parallelism); the sanctioned fallback is
-    // adapt_for_cpu-style: build on device later, search on CPU. Until the
-    // AOT artifact exists, return -1 so the caller uses the CPU traversal
-    // (design D5), matching the plan's Phase 2.3 downgrade path.
-    (void)xb; (void)nb; (void)dim; (void)graph_ids; (void)graph_offsets;
-    (void)max_degree; (void)xq; (void)nq; (void)k; (void)itopk; (void)metric;
-    (void)out_dist; (void)out_ids; (void)stream;
-    (void)kGraphSearchArtifact;
-    return -1;
-}
-
-const FlDeviceOps g_ppu_ops = {
-    hgDeviceCount,     hgSetDevice,      hgDeviceSynchronize,
-    hgMemAlloc,        [](void* p) { (void)hgMemFree(p); },
-    hgMemcpyH2D,       hgMemcpyD2H,      hgMemcpyD2D,
-    hgStreamCreate,    [](void* s) { (void)hgStreamDestroy(s); }, hgStreamSynchronize,
-    ppu_brute_force_topk,
-    ppu_ivf_flat_scan,
-    ppu_kmeans_assign,
-    ppu_ivf_pq_scan,
-    ppu_graph_search,
+const FlDeviceOps ops = {
+    ppu::DeviceCount, ppu::SetDevice, ppu::DeviceSync,
+    ppu::Alloc, ppu::Free, ppu::CopyH2D, ppu::CopyD2H, ppu::CopyD2D,
+    ppu::StreamCreate, ppu::StreamDestroy, ppu::StreamSync,
+    TopK, IvfFlat, ppu::Assign, IvfPq,
+    nullptr  // Graph traversal remains an explicit CPU fallback; no fake PPU acceleration.
 };
-
 }  // namespace
-
-// Called by Milvus/knowhere init glue when WITH_FL + PPU are enabled.
-bool
-RegisterPpuAdapter() {
-    RegisterDeviceOps(&g_ppu_ops);
-    LOG_KNOWHERE_INFO_ << "FL PPU adapter registered";
+bool RegisterPpuAdapter() {
+    if (ppu::DeviceCount() <= 0) return false;
+    RegisterDeviceOps(&ops);
+    LOG_KNOWHERE_INFO_ << "FL PPU native HG adapter registered (FlagTree Triton/Triton-TLE AOT)";
     return true;
 }
-
-}  // namespace fl
-}  // namespace knowhere
-
-#endif  // KNOWHERE_FL_WITH_PPU
+}  // namespace knowhere::fl
+#endif

@@ -1,0 +1,47 @@
+# Copyright (C) 2026 knowhere-FL contributors.
+# Licensed under the Apache License, Version 2.0.
+# Standalone native HG contract tests, independent of Knowhere's large Conan
+# graph. This does not replace the complete library/unit-test build.
+cmake_minimum_required(VERSION 3.26)
+project(knowhere_ppu_contract_tests LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(PPU_SDK_PATH "$ENV{PPU_SDK_PATH}" CACHE PATH "Native HG SDK root")
+find_path(PPU_INCLUDE_DIR hggc.h HINTS "${PPU_SDK_PATH}/include" REQUIRED)
+find_library(PPU_HG_LIBRARY hggc HINTS "${PPU_SDK_PATH}/lib" "${PPU_SDK_PATH}/lib64" REQUIRED)
+find_package(nlohmann_json 3.11 QUIET)
+if(NOT nlohmann_json_FOUND)
+  find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp REQUIRED)
+endif()
+get_filename_component(KNOWHERE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+add_executable(knowhere_ppu_test test_ppu_runtime.cc
+  "${KNOWHERE_ROOT}/src/common/fl/adapter/ppu/fl_ppu_runtime.cc")
+target_compile_definitions(knowhere_ppu_test PRIVATE KNOWHERE_FL_WITH_PPU)
+target_include_directories(knowhere_ppu_test PRIVATE "${KNOWHERE_ROOT}/src" "${PPU_INCLUDE_DIR}")
+if(nlohmann_json_FOUND)
+  target_link_libraries(knowhere_ppu_test PRIVATE nlohmann_json::nlohmann_json)
+else()
+  target_include_directories(knowhere_ppu_test PRIVATE "${NLOHMANN_JSON_INCLUDE_DIR}")
+endif()
+target_link_libraries(knowhere_ppu_test PRIVATE "${PPU_HG_LIBRARY}")
+enable_testing()
+add_test(NAME knowhere_ppu_real_device COMMAND knowhere_ppu_test)
+
+# Optional registration integration test, using real logging dependencies.
+find_package(glog QUIET)
+if(glog_FOUND)
+  add_executable(knowhere_ppu_registration_test test_ppu_registration.cc
+    "${KNOWHERE_ROOT}/src/common/fl/fl_device.cc"
+    "${KNOWHERE_ROOT}/src/common/fl/adapter/ppu/fl_ppu_adapter.cc"
+    "${KNOWHERE_ROOT}/src/common/fl/adapter/ppu/fl_ppu_runtime.cc")
+  target_compile_definitions(knowhere_ppu_registration_test PRIVATE KNOWHERE_FL_WITH_PPU)
+  target_include_directories(knowhere_ppu_registration_test PRIVATE
+    "${KNOWHERE_ROOT}/src" "${KNOWHERE_ROOT}/include" "${PPU_INCLUDE_DIR}")
+  if(nlohmann_json_FOUND)
+    target_link_libraries(knowhere_ppu_registration_test PRIVATE nlohmann_json::nlohmann_json)
+  else()
+    target_include_directories(knowhere_ppu_registration_test PRIVATE "${NLOHMANN_JSON_INCLUDE_DIR}")
+  endif()
+  target_link_libraries(knowhere_ppu_registration_test PRIVATE "${PPU_HG_LIBRARY}" glog::glog)
+  add_test(NAME knowhere_ppu_registration COMMAND knowhere_ppu_registration_test)
+endif()

@@ -266,11 +266,14 @@ Milvus internal/core 支持以本地 knowhere 源码树替代 conan 包。将本
 
 ## 2. 芯片适配器注册（关键一步）
 
-knowhere 只提供 `RegisterDeviceOps` 挂载点，**适配器必须在 Milvus 进程启动早期注册**：
+knowhere 提供 `RegisterDeviceOps` 挂载点，适配器应在索引使用前完成注册：
 
-- **PPU**：`WITH_FL_PPU=ON` 构建时，`fl_ppu_adapter.cc` 中的
-  `RegisterPpuAdapter()` 需被调用一次。推荐在 knowhere 的 FL 初始化函数
-  （`src/common/fl/fl_device.cc` 中暴露的惰性注册）或 Milvus segcore 初始化处调用。
+- **PPU**：`WITH_FL_PPU=ON` 构建时，首次调用 `GetDeviceOps()`、
+  `DeviceCount()` 或 `DeviceAvailable()` 会通过 `std::call_once` 懒注册原生 HG 适配器，
+  不再要求 Milvus 手动调用 `RegisterPpuAdapter()`。还需配置
+  `KNOWHERE_FL_PPU_KERNEL_DIR` 并离线编译相应 Triton/Triton-TLE specialization；
+  [PPU 算子实现与验证](docs/ppu-triton.md) 给出了真实 SDK、编译和测试命令。
+  产物缺失或不兼容会明确报错并触发调用侧 CPU 回退，不能算作 PPU 加速。
 - **无适配器**：索引仍可建/查，全部走 CPU 回退路径（D5），性能等同 CPU 索引。
 - **Host 适配器**（`RegisterHostAdapter()`）：仅用于 CI/UT，不要在生产注册。
 

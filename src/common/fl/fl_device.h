@@ -26,16 +26,20 @@ namespace fl {
 // of FlagOS (a unified open-source AI system software stack).
 //
 // This file is the heart of that abstraction. knowhere-FL never calls a chip
-// runtime directly. All device interaction goes through FlDeviceOps, a C-ABI
-// function table implemented by a per-chip adapter (e.g. the PPU adapter that
-// wraps the validated FlagFit launch path: HIDDEN_PARAM / hgLaunchKernelEx /
-// device context binding). The adapter is registered at process start (or
-// lazily via RegisterPpuAdapter()) before any FL index is built.
+// runtime directly outside its adapters. All device interaction goes through
+// FlDeviceOps, implemented by a per-chip adapter. The PPU adapter loads
+// FlagTree AOT Triton/Triton-TLE artifacts through native HG module/launch APIs.
+// It is registered lazily before any FL index is built.
 //
 // Metric encoding for kernels: 0 = L2, 1 = IP. COSINE is intentionally not a
 // kernel metric; per design decision D4 it must be handled by normalizing
 // vectors and using IP.
 // ---------------------------------------------------------------------------
+
+#ifdef KNOWHERE_FL_WITH_PPU
+// Native adapter registration; also called lazily by GetDeviceOps().
+bool RegisterPpuAdapter();
+#endif
 
 struct FlDeviceOps {
     // device management
@@ -57,8 +61,9 @@ struct FlDeviceOps {
     void (*stream_destroy)(void* stream);
     int (*stream_sync)(void* stream);
 
-    // retrieval kernels (AOT-compiled Triton binaries produced through
-    // FlagGems compositions + FlagTree, loaded and launched by the adapter).
+    // Retrieval kernels implemented in FlagOS operator libraries or in
+    // Triton/Triton-TLE, AOT-compiled by FlagTree and launched by the adapter.
+    // FlagOS is a multi-library ecosystem, not an alias for FlagGems.
     //
     // brute_force_topk: computes top-k of distance(xq[i], xb[j]) for all j.
     //   xb/xq are DEVICE pointers, out_dist/out_ids are HOST pointers.
@@ -75,8 +80,8 @@ struct FlDeviceOps {
                          const int64_t* cand_offsets, int64_t k, int metric, float* out_dist, int64_t* out_ids,
                          void* stream);
 
-    // kmeans_assign: routes every base vector to its nearest centroid
-    // (mm + argmin composition; no atomics, safe on all FlagOS targets).
+    // kmeans_assign: routes every base vector to its nearest centroid.
+    // The PPU implementation reuses distance + top-1; no atomic update.
     //   xb/centroids are DEVICE pointers; assign (nb centroid ids) is HOST.
     //   Returns 0 on success. May be nullptr -> caller falls back to CPU
     //   routing. Centroid *update* is intentionally NOT a device op in v1:
@@ -91,9 +96,9 @@ struct FlDeviceOps {
     //   codebooks (m * ksub * dsub floats) and codes (nb * m uint8, one code
     //   per subquantizer; v1 supports nbits=8 only) are DEVICE pointers; xq
     //   is DEVICE; cand_ids/cand_offsets are HOST (the adapter uploads them).
-    //   The adapter computes per-query LUTs (nq x m x ksub, via mm against
-    //   reshaped codebooks - FlagGems composition) on device, then scans
-    //   candidates accumulating LUT entries. out_* are HOST.
+    //   The adapter computes asymmetric distances from codebooks and codes;
+    //   implementations may use a per-query LUT or fused direct accumulation.
+    //   out_* are HOST.
     //   Returns 0 on success. May be nullptr -> caller falls back to CPU ADC.
     int (*ivf_pq_scan)(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, const void* codes, int64_t nb,
                        const void* xq, int64_t nq, int64_t dim, const int64_t* cand_ids, const int64_t* cand_offsets,

@@ -23,6 +23,8 @@ CONAN_INSTALL_FLAGS := --update --build=missing
 # Usage: make WITH_GPU=True WITH_UT=True WITH_ASAN=True WITH_DEBUG=True
 WITH_GPU ?= False
 WITH_CUVS ?=
+WITH_FL ?=
+WITH_FL_PPU ?=
 WITH_UT ?=
 WITH_BENCHMARK ?=
 WITH_ASAN ?=
@@ -46,7 +48,7 @@ export CMAKE_POLICY_VERSION_MINIMUM ?= 3.5
 # folly recipe to pick up $ENV{WITH_ASAN} and compile folly itself with
 # -fsanitize=address — breaking the build on GCC.
 unexport WITH_GPU WITH_CUVS WITH_UT WITH_BENCHMARK WITH_ASAN WITH_DISKANN WITH_CARDINAL CARDINAL_VERSION_FORCE_CHECKOUT WITH_DEBUG \
-	WITH_C_API WITH_JNI WITH_C_API_TESTS
+	WITH_C_API WITH_JNI WITH_C_API_TESTS WITH_FL WITH_FL_PPU
 
 # ---------- Derived settings ----------
 ifdef WITH_DEBUG
@@ -102,6 +104,27 @@ ifneq ($(WITH_CUVS),)
         CONAN_SETTINGS += -o \&:with_cuvs=False
     else
         $(error WITH_CUVS must be True/False, ON/OFF, or 1/0)
+    endif
+endif
+
+# Pass FlagOS selection to Conan; unlike legacy ifdef flags these accept
+# explicit false values, so disabling PPU does not accidentally enable it.
+ifneq ($(WITH_FL),)
+    ifneq ($(filter True true ON on 1,$(WITH_FL)),)
+        CONAN_SETTINGS += -o \&:with_fl=True
+    else ifneq ($(filter False false OFF off 0,$(WITH_FL)),)
+        CONAN_SETTINGS += -o \&:with_fl=False
+    else
+        $(error WITH_FL must be True/False, ON/OFF, or 1/0)
+    endif
+endif
+ifneq ($(WITH_FL_PPU),)
+    ifneq ($(filter True true ON on 1,$(WITH_FL_PPU)),)
+        CONAN_SETTINGS += -o \&:with_fl_ppu=True
+    else ifneq ($(filter False false OFF off 0,$(WITH_FL_PPU)),)
+        CONAN_SETTINGS += -o \&:with_fl_ppu=False
+    else
+        $(error WITH_FL_PPU must be True/False, ON/OFF, or 1/0)
     endif
 endif
 

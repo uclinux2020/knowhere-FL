@@ -297,9 +297,13 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             throw std::runtime_error("Incomplete implicit ID kernel bundle");
         }
         const bool use_lut = codes && bundle->kernels.count("pq_lut") && bundle->kernels.count("pq_adc");
-        const std::string fused_name = ivf ? "fused_ivf" : "fused_distance";
+        const bool compact = !ivf && !codes && bundle->kernels.count("matrix_compact");
+        if (compact && (k != 1 || !bundle->kernels.count("transpose_base"))) {
+            throw std::runtime_error("Matrix compact kernel requires top-1 and packed base");
+        }
+        const std::string fused_name = compact ? "matrix_compact" : ivf ? "fused_ivf" : "fused_distance";
         const bool fused = !codes && bundle->kernels.count(fused_name) != 0;
-        const int64_t local_block = fused ? bundle->fused_block : bundle->select_block;
+        const int64_t local_block = compact ? bundle->block : fused ? bundle->fused_block : bundle->select_block;
         const int64_t tiles = (width + local_block - 1) / local_block;
         const int64_t compact_width = tiles * k;
         const uint64_t row_bytes = (fused ? 0 : static_cast<uint64_t>(width) * (implicit ? 4 : 12)) +
@@ -397,7 +401,13 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             int64_t base = 0;
             unsigned score_grid = static_cast<unsigned>((width + bundle->block - 1) / bundle->block);
             int64_t fused_tiles = tiles;
-            if (fused) {
+            if (compact) {
+                int64_t queries = query_count;
+                bundle->Get(fused_name).Launch({&vectors, &query_ptr, &compact_a.ptr, &ids_a.ptr,
+                                               &nb, &width, &fused_tiles, &queries},
+                                              static_cast<unsigned>(tiles), stream,
+                                              (query_count + bundle->queries_per_block - 1) / bundle->queries_per_block);
+            } else if (fused) {
                 bundle->Get(fused_name).Launch({&vectors, &query_ptr, &candidate_buffer.ptr, &off_ptr,
                                                &compact_a.ptr, &ids_a.ptr, &nb, &width, &fused_tiles},
                                               static_cast<unsigned>(tiles), stream, query_count);
@@ -429,7 +439,7 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             bool first_level = true;
             while (true) {
                 int64_t level_tiles = (input_width + bundle->select_block - 1) / bundle->select_block;
-                bundle->Get(implicit && first_level ? "select_implicit" : "select").Launch({&in_score, &in_ids, &out_score, &out_ids, &input_width, &level_tiles},
+                bundle->Get(implicit && !fused && first_level ? "select_implicit" : "select").Launch({&in_score, &in_ids, &out_score, &out_ids, &input_width, &level_tiles},
                                              static_cast<unsigned>(level_tiles), stream, query_count);
                 first_level = false;
                 if (level_tiles == 1) break;

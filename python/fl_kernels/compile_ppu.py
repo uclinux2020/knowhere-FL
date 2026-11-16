@@ -22,6 +22,7 @@ def main():
     ap.add_argument('--ksub', type=int, default=256)
     ap.add_argument('--block', type=int, default=128)
     ap.add_argument('--select-block', type=int, default=1024)
+    ap.add_argument('--compact-score', action='store_true', help='Select matrix tile top-k before global storage')
     ap.add_argument('--transpose-base', action='store_true', help='Request-owned coalesced matrix base layout')
     ap.add_argument('--num-warps', type=int, choices=[2, 4, 8], default=4)
     ap.add_argument('--implicit-ids', action='store_true', help='Eliminate brute-force score-table ID storage')
@@ -54,6 +55,9 @@ def main():
     if not args.matrix and args.queries_per_block > 4:
         ap.error('direct distance configuration supports queries-per-block <= 4')
     from matrix_distance import matrix_distance_scores
+    from matrix_compact import matrix_compact
+    if args.compact_score and (not args.transpose_base or args.k != 1):
+        ap.error('compact-score currently requires transpose-base and k=1')
     from transpose_base import transpose_base
     if args.transpose_base and not args.matrix:
         ap.error('transpose-base requires matrix')
@@ -127,6 +131,12 @@ def main():
             emit('fused_ivf' if ivf else 'fused_distance', fused_distance_topk, fused_sig,
                  {'DIM': args.dim, 'K': args.k, 'METRIC': metric, 'IVF': ivf, 'BLOCK': args.fused_block,
                   'BD': triton.next_power_of_2(args.dim), 'USE_TLE': args.tle})
+    if args.compact_score:
+        emit('matrix_compact', matrix_compact,
+             {'XB': '*fp32', 'XQ': '*fp32', 'OUT_SCORES': '*fp32', 'OUT_IDS': '*i64',
+              'NB': 'i64', 'WIDTH': 'i64', 'TILES': 'i64', 'NQ': 'i64'},
+             {'DIM': args.dim, 'K': args.k, 'METRIC': metric, 'BLOCK': args.block,
+              'BD': triton.next_power_of_2(args.dim), 'QPB': args.queries_per_block, 'USE_TLE': args.tle})
     if args.transpose_base:
         emit('transpose_base', transpose_base, {'XB': '*fp32', 'PACKED': '*fp32', 'NB': 'i64'},
              {'DIM': args.dim, 'BN': 32, 'BD': 32})

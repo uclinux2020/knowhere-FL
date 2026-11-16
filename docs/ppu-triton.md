@@ -105,6 +105,12 @@ Search将临时设备缓冲合并为一次对齐arena分配，仍在请求结束
 减少masked lane重复计算。默认64MiB百万规模无显著变化；显式256MiB百万逆序配对改善约12%，
 详见 [批量对齐与退化实验报告](ppu-batch-alignment-20261116.md)。
 
+## 可选精确局部top-1压缩
+
+`--compact-score`仅支持矩阵转置配置的k1：tile内求最优score/ID后才写全局内存，
+避免完整score表物化。百万/nq200请求从11.51ms降至8.25ms；k10融合发生退化，未启用。
+完整精度、显存取舍与退化样本见 [局部top-1报告](ppu-compact-top1-20261116.md)。
+
 ## 独立真实设备测试（无完整 Conan graph）
 
 需 FlagTree PPU Python 和 nlohmann/json C++ 头文件（不需要 Torch 或 NumPy）。从仓库根目录执行：

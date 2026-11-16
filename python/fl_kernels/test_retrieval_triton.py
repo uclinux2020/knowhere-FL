@@ -22,6 +22,7 @@ def main():
     ap.add_argument('--output', required=True)
     ap.add_argument('--test-executable', required=True)
     ap.add_argument('--device', type=int, default=0)
+    ap.add_argument('--pq-lut', action='store_true')
     ap.add_argument('--tle', action='store_true')
     ap.add_argument('--dim', type=int, default=5)
     ap.add_argument('--k', type=int, default=3)
@@ -39,6 +40,8 @@ def main():
         command = [sys.executable, str(compiler), '--dim', str(args.dim), '--k', str(k), '--metric', metric,
                    '--block', str(args.block), '--select-block', str(args.select_block), '--m', str(m), '--ksub', str(ksub),
                    '--output', str(bundle)]
+        if args.pq_lut and m > 0:
+            command.append('--pq-lut')
         if args.tle:
             command.append('--tle')
         subprocess.run(command, check=True)

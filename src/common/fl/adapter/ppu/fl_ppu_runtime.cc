@@ -290,12 +290,14 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             return 0;
         }
         if (width > 65535 * bundle->block) throw std::runtime_error("PPU score grid exceeds supported width");
+        const bool use_lut = codes && bundle->kernels.count("pq_lut") && bundle->kernels.count("pq_adc");
         const std::string fused_name = ivf ? "fused_ivf" : "fused_distance";
         const bool fused = !codes && bundle->kernels.count(fused_name) != 0;
         const int64_t local_block = fused ? bundle->fused_block : bundle->select_block;
         const int64_t tiles = (width + local_block - 1) / local_block;
         const int64_t compact_width = tiles * k;
-        const uint64_t row_bytes = static_cast<uint64_t>((fused ? 0 : width) + 2 * compact_width) * 12;
+        const uint64_t row_bytes = static_cast<uint64_t>((fused ? 0 : width) + 2 * compact_width) * 12 +
+                                   (use_lut ? static_cast<uint64_t>(m * ksub) * sizeof(float) : 0);
         uint64_t workspace_limit = 64ULL << 20;
         if (const char* raw = std::getenv("KNOWHERE_FL_PPU_WORKSPACE_MB")) {
             char* end = nullptr;
@@ -309,6 +311,7 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
         const int64_t batch = std::min<int64_t>(nq, workspace_limit / row_bytes);
         Buffer candidate_buffer(ivf ? static_cast<size_t>(offsets[nq]) * sizeof(int64_t) : 1, stream);
         Buffer offset_buffer(ivf ? (nq + 1) * sizeof(int64_t) : 1, stream);
+        Buffer lookup(use_lut ? batch * m * ksub * sizeof(float) : 1, stream);
         Buffer scores(fused ? 1 : batch * width * sizeof(float), stream);
         Buffer members(fused ? 1 : batch * width * sizeof(int64_t), stream);
         Buffer compact_a(batch * compact_width * sizeof(float), stream);
@@ -331,6 +334,11 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
                 bundle->Get(fused_name).Launch({&vectors, &query_ptr, &candidate_buffer.ptr, &off_ptr,
                                                &compact_a.ptr, &ids_a.ptr, &nb, &width, &fused_tiles},
                                               static_cast<unsigned>(tiles), stream, query_count);
+            } else if (use_lut) {
+                bundle->Get("pq_lut").Launch({&vectors, &query_ptr, &lookup.ptr},
+                                              static_cast<unsigned>(m), stream, query_count);
+                bundle->Get("pq_adc").Launch({&lookup.ptr, &encoded_codes, &candidate_buffer.ptr, &off_ptr,
+                                              &scores.ptr, &members.ptr, &nb, &width}, score_grid, stream, query_count);
             } else if (codes) {
                 bundle->Get("pq").Launch({&vectors, &encoded_codes, &query_ptr, &candidate_buffer.ptr, &off_ptr,
                                           &scores.ptr, &members.ptr, &nb, &width, &base}, score_grid, stream, query_count);

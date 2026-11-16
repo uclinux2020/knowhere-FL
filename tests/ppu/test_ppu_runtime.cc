@@ -124,6 +124,20 @@ int main(int argc, char** argv) {
             Require(ppu::Search(book.ptr, nb, query.ptr, nq, dim, k, metric, cand.data(), offsets.data(),
                                 distances.data(), ids.data(), stream, encoded.ptr, m, ksub, dsub) == 0, "PQ search failed");
             Verify(decoded, xq, nb, nq, dim, k, metric, cand, offsets, distances, ids);
+            // LUTs must be regenerated, not cached solely by device address.
+            for (auto& value : cb) value += .25f;
+            for (int64_t i = 0; i < nb; ++i) {
+                for (int64_t s = 0; s < m; ++s) {
+                    std::copy_n(cb.data() + (s * ksub + codes[i * m + s]) * dsub, dsub,
+                                decoded.data() + i * dim + s * dsub);
+                }
+            }
+            Require(ppu::CopyH2D(book.ptr, cb.data(), cb.size() * sizeof(float), stream) == 0,
+                    "updated codebook H2D failed");
+            Require(ppu::Search(book.ptr, nb, query.ptr, nq, dim, k, metric, cand.data(), offsets.data(),
+                                distances.data(), ids.data(), stream, encoded.ptr, m, ksub, dsub) == 0,
+                    "updated PQ search failed");
+            Verify(decoded, xq, nb, nq, dim, k, metric, cand, offsets, distances, ids);
             std::vector<int64_t> assign(nq);
             Require(ppu::Assign(query.ptr, nq, dim, base.ptr, nb, metric, assign.data(), stream) == 0, "assignment failed");
             std::vector<float> assignment_distances(nq);

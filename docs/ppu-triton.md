@@ -71,6 +71,13 @@ export KNOWHERE_FL_PPU_KERNEL_DIR="$PWD/build/ppu-kernels"
 数值、预算及适用范围见 [矩阵距离限定验收](ppu-matrix-20261116.md)。
 默认直接距离和64MiB预算保持不变，不将特定配置的成绩泛化为所有输入都更快。
 
+## 可选 PQ LUT 复用配置
+
+`--pq-lut --m 16 --ksub 256` 将 per-candidate codebook 距离计算替换为 per-query LUT + ADC。
+128维/k10/nq16，10k/100k/1M候选较旧PPU实现改善约2.1–2.35x；
+预算、数值和完整样本见 [PQ查表复用优化](ppu-pq-lut-20261116.md)。
+旧manifest仍走直接计算，不使用设备地址缓存LUT。
+
 ## 独立真实设备测试（无完整 Conan graph）
 
 需 FlagTree PPU Python 和 nlohmann/json C++ 头文件（不需要 Torch 或 NumPy）。从仓库根目录执行：

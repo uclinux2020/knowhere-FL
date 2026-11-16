@@ -22,6 +22,7 @@ def main():
     ap.add_argument('--ksub', type=int, default=256)
     ap.add_argument('--block', type=int, default=128)
     ap.add_argument('--select-block', type=int, default=1024)
+    ap.add_argument('--pq-lut', action='store_true', help='Reuse per-query PQ lookup tables')
     ap.add_argument('--matrix', action='store_true', help='Opt-in IEEE FP32 matrix distance configuration')
     ap.add_argument('--queries-per-block', type=int, choices=[1, 2, 4, 16, 32], default=4)
     ap.add_argument('--fused', action='store_true', help='Experimental distance/local-topk fusion')
@@ -50,6 +51,9 @@ def main():
     if not args.matrix and args.queries_per_block > 4:
         ap.error('direct distance configuration supports queries-per-block <= 4')
     from matrix_distance import matrix_distance_scores
+    from pq_lut import pq_lookup, pq_adc
+    if args.pq_lut and args.m == 0:
+        ap.error('pq-lut requires m > 0')
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -90,6 +94,15 @@ def main():
              {'DIM': args.dim, 'M': args.m, 'KSUB': args.ksub, 'DSUB': args.dim // args.m,
               'METRIC': metric, 'BLOCK': args.block, 'BD': triton.next_power_of_2(args.dim // args.m),
               'USE_TLE': args.tle})
+    if args.pq_lut:
+        emit('pq_lut', pq_lookup, {'CB': '*fp32', 'XQ': '*fp32', 'LUT': '*fp32'},
+             {'DIM': args.dim, 'M': args.m, 'KSUB': args.ksub, 'DSUB': args.dim // args.m,
+              'METRIC': metric, 'BD': triton.next_power_of_2(args.dim // args.m),
+              'BK': triton.next_power_of_2(args.ksub), 'USE_TLE': args.tle})
+        emit('pq_adc', pq_adc,
+             {'LUT': '*fp32', 'CODES': '*u8', 'CAND': '*i64', 'OFFSETS': '*i64',
+              'SCORES': '*fp32', 'IDS': '*i64', 'NB': 'i64', 'WIDTH': 'i64'},
+             {'M': args.m, 'KSUB': args.ksub, 'METRIC': metric, 'BLOCK': args.block})
     if args.m == 0:
         emit('batched_distance', matrix_distance_scores if args.matrix else batched_distance_scores,
              {'XB': '*fp32', 'XQ': '*fp32', 'SCORES': '*fp32', 'IDS': '*i64', 'NB': 'i64', 'WIDTH': 'i64', 'NQ': 'i64'},

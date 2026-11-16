@@ -56,8 +56,9 @@ int main(int argc, char** argv) {
         int device = argc > 1 ? std::stoi(argv[1]) : 0;
         Require(ppu::DeviceCount() > device, "PPU device unavailable");
         Require(ppu::SetDevice(device) == 0, "PPU context binding failed");
-        void* stream = ppu::StreamCreate();
-        Require(stream != nullptr, "PPU stream creation failed");
+        const bool default_stream = argc > 5 && std::string(argv[5]) == "default-stream";
+        void* stream = default_stream ? nullptr : ppu::StreamCreate();
+        Require(default_stream || stream != nullptr, "PPU stream creation failed");
         const int64_t nb = 67, nq = 3;
         const int64_t dim = argc > 2 ? std::stoll(argv[2]) : 5;
         const int64_t k = argc > 3 ? std::stoll(argv[3]) : 3;

@@ -86,6 +86,12 @@ export KNOWHERE_FL_PPU_KERNEL_DIR="$PWD/build/ppu-kernels"
 详见 [隐式ID及端到端边界报告](ppu-implicit-id-20261116.md)。
 IVF/PQ候选不使用隐式ID，旧manifest仍兼容。
 
+## 请求内单块工作区
+
+Search将临时设备缓冲合并为一次对齐arena分配，仍在请求结束释放，不缓存查询结果。
+小请求真机计时改善约7%–27%，百万规模计算几乎不变；
+默认流/显式流回归及退化选择器实验见 [工作区优化报告](ppu-workspace-arena-20261116.md)。
+
 ## 独立真实设备测试（无完整 Conan graph）
 
 需 FlagTree PPU Python 和 nlohmann/json C++ 头文件（不需要 Torch 或 NumPy）。从仓库根目录执行：

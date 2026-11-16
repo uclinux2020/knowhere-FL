@@ -316,15 +316,35 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
         }
         if (row_bytes > workspace_limit) throw std::runtime_error("PPU workspace budget cannot fit one query");
         const int64_t batch = std::min<int64_t>(nq, workspace_limit / row_bytes);
-        Buffer candidate_buffer(ivf ? static_cast<size_t>(offsets[nq]) * sizeof(int64_t) : 1, stream);
-        Buffer offset_buffer(ivf ? (nq + 1) * sizeof(int64_t) : 1, stream);
-        Buffer lookup(use_lut ? batch * m * ksub * sizeof(float) : 1, stream);
-        Buffer scores(fused ? 1 : batch * width * sizeof(float), stream);
-        Buffer members(fused || implicit ? 1 : batch * width * sizeof(int64_t), stream);
-        Buffer compact_a(batch * compact_width * sizeof(float), stream);
-        Buffer ids_a(batch * compact_width * sizeof(int64_t), stream);
-        Buffer compact_b(batch * compact_width * sizeof(float), stream);
-        Buffer ids_b(batch * compact_width * sizeof(int64_t), stream);
+        // One request-owned allocation avoids repeated HG allocator and
+        // destructor synchronizations. No cross-request result/data caching.
+        const size_t sizes[] = {
+            ivf ? static_cast<size_t>(offsets[nq]) * sizeof(int64_t) : 1,
+            ivf ? static_cast<size_t>(nq + 1) * sizeof(int64_t) : 1,
+            use_lut ? static_cast<size_t>(batch * m * ksub) * sizeof(float) : 1,
+            fused ? 1 : static_cast<size_t>(batch * width) * sizeof(float),
+            fused || implicit ? 1 : static_cast<size_t>(batch * width) * sizeof(int64_t),
+            static_cast<size_t>(batch * compact_width) * sizeof(float),
+            static_cast<size_t>(batch * compact_width) * sizeof(int64_t),
+            static_cast<size_t>(batch * compact_width) * sizeof(float),
+            static_cast<size_t>(batch * compact_width) * sizeof(int64_t)};
+        size_t total = 0;
+        size_t starts[9];
+        for (size_t i = 0; i < 9; ++i) {
+            if (sizes[i] > std::numeric_limits<size_t>::max() - 255 ||
+                total > std::numeric_limits<size_t>::max() - ((sizes[i] + 255) & ~size_t(255))) {
+                throw std::runtime_error("PPU workspace size overflow");
+            }
+            starts[i] = total;
+            total += (sizes[i] + 255) & ~size_t(255);
+        }
+        Buffer workspace(total, stream);
+        struct Slice { HGdeviceptr ptr; };
+        Slice candidate_buffer{workspace.ptr + starts[0]}, offset_buffer{workspace.ptr + starts[1]};
+        Slice lookup{workspace.ptr + starts[2]}, scores{workspace.ptr + starts[3]};
+        Slice members{workspace.ptr + starts[4]}, compact_a{workspace.ptr + starts[5]};
+        Slice ids_a{workspace.ptr + starts[6]}, compact_b{workspace.ptr + starts[7]};
+        Slice ids_b{workspace.ptr + starts[8]};
         if (ivf) {
             if (offsets[nq]) Check(hgMemcpyHtoD(candidate_buffer.ptr, candidates, offsets[nq] * sizeof(int64_t)));
             Check(hgMemcpyHtoD(offset_buffer.ptr, offsets, (nq + 1) * sizeof(int64_t)));

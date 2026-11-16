@@ -64,6 +64,13 @@ export KNOWHERE_FL_PPU_KERNEL_DIR="$PWD/build/ppu-kernels"
 
 每个 context 独立缓存模块，资源释放时绑定原 context。首次 `GetDeviceOps/DeviceCount/DeviceAvailable` 会懒注册 PPU adapter；不需要 Milvus 额外初始化胶水。`RegisterDeviceOps(nullptr)` 后不会反复重新注册。
 
+## 可选 IEEE FP32 矩阵距离配置
+
+在同一 Triton/TLE 真机链内增加 `--matrix --queries-per-block 16 --block 64`。
+128维/k10/L2/nq200、显式1024MiB工作区下，100k/500k/1M两轮配对均快于历史CUDA-C；
+数值、预算及适用范围见 [矩阵距离限定验收](ppu-matrix-20261116.md)。
+默认直接距离和64MiB预算保持不变，不将特定配置的成绩泛化为所有输入都更快。
+
 ## 独立真实设备测试（无完整 Conan graph）
 
 需 FlagTree PPU Python 和 nlohmann/json C++ 头文件（不需要 Torch 或 NumPy）。从仓库根目录执行：

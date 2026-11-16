@@ -75,6 +75,20 @@ int main(int argc, char** argv) {
             Require(ppu::Search(base.ptr, nb, query.ptr, nq, dim, k, metric, nullptr, nullptr,
                                 distances.data(), ids.data(), stream) == 0, "brute-force device search failed");
             Verify(xb, xq, nb, nq, dim, k, metric, {}, {}, distances, ids);
+            // Large common offsets must not break L2 norm decomposition.
+            if (metric == 0) {
+                for (size_t i = 0; i < xb.size(); ++i) xb[i] = 10000.f + static_cast<float>(i % 31) * .125f;
+                for (size_t i = 0; i < xq.size(); ++i) xq[i] = 10000.f + static_cast<float>(i % 29) * .125f;
+                Require(ppu::CopyH2D(base.ptr, xb.data(), xb.size() * sizeof(float), stream) == 0, "offset base H2D failed");
+                Require(ppu::CopyH2D(query.ptr, xq.data(), xq.size() * sizeof(float), stream) == 0, "offset query H2D failed");
+                Require(ppu::Search(base.ptr, nb, query.ptr, nq, dim, k, metric, nullptr, nullptr,
+                                    distances.data(), ids.data(), stream) == 0, "large-offset search failed");
+                Verify(xb, xq, nb, nq, dim, k, metric, {}, {}, distances, ids);
+                for (size_t i = 0; i < xb.size(); ++i) xb[i] = std::sin(static_cast<float>(i) * 1.37f);
+                for (size_t i = 0; i < xq.size(); ++i) xq[i] = std::cos(static_cast<float>(i) * .73f);
+                Require(ppu::CopyH2D(base.ptr, xb.data(), xb.size() * sizeof(float), stream) == 0, "restore base failed");
+                Require(ppu::CopyH2D(query.ptr, xq.data(), xq.size() * sizeof(float), stream) == 0, "restore query failed");
+            }
             std::vector<int64_t> cand = {4, 1, 66, 2, 13, 41};
             std::vector<int64_t> offsets = {0, 0, 2, 6};
             Require(ppu::Search(base.ptr, nb, query.ptr, nq, dim, k, metric, cand.data(), offsets.data(),
@@ -118,7 +132,7 @@ int main(int argc, char** argv) {
         }
         ppu::StreamDestroy(stream);
         ppu::Free(nullptr);
-        std::cout << "PASS: real PPU L2/IP brute-force, chunk merge, IVF, PQ, assignment, ties, padding, invalid CSR\n";
+        std::cout << "PASS: real PPU L2/IP brute-force, chunk merge, IVF, PQ, assignment, ties, padding, invalid CSR, large-offset L2\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';

@@ -151,7 +151,8 @@ struct Bundle {
         queries_per_block = meta.value("queries_per_block", 1);
         if (dim <= 0 || k <= 0 || 2 * k > select_block || select_block > 65536 || block <= 0 ||
             (block & (block - 1)) || (select_block & (select_block - 1)) || (metric != 0 && metric != 1) ||
-            (queries_per_block != 1 && queries_per_block != 2 && queries_per_block != 4) ||
+            (queries_per_block != 1 && queries_per_block != 2 && queries_per_block != 4 &&
+             queries_per_block != 16 && queries_per_block != 32) ||
             fused_block <= 0 || (fused_block & (fused_block - 1))) {
             throw std::runtime_error("Invalid PPU retrieval bundle shape");
         }

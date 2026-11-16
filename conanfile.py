@@ -103,6 +103,7 @@ class KnowhereConan(ConanFile):
         "python/fl_kernels/compile_ppu.py",
         "python/fl_kernels/retrieval_triton.py",
         "python/fl_kernels/batched_distance.py",
+        "python/fl_kernels/matrix_distance.py",
         "python/fl_kernels/fused_retrieval.py",
         "python/fl_kernels/no_torch.py",
         "tests/ppu/*",

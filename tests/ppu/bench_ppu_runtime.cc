@@ -128,7 +128,9 @@ int main(int argc, char** argv) {
         omp_set_dynamic(0); omp_set_num_threads(threads);
         Require(ppu::SetDevice(device) == 0, "PPU context binding failed");
         StreamGuard stream;
-        std::mt19937 rng(42);
+        unsigned seed = 42;
+        if (const char* raw = std::getenv("KNOWHERE_PPU_BENCH_SEED")) seed = static_cast<unsigned>(std::stoul(raw));
+        std::mt19937 rng(seed);
         std::uniform_real_distribution<float> random(-1, 1);
         std::vector<float> xb(nb * dim), queries(nq * dim);
         for (auto& x : xb) x = random(rng);
@@ -225,8 +227,10 @@ int main(int argc, char** argv) {
         Json cpu = Summary(cpu_times, nq), ppu_times = Summary(times, nq);
         struct rusage usage{}; getrusage(RUSAGE_SELF, &usage);
         Json report = {{"schema", 1}, {"path", legacy_path ? "historical CUDA-C artifact via native HG (comparison only)" : "FlagOS Triton with Triton-TLE -> FlagTree AOT -> native HG -> PPU"},
-                       {"mode", mode}, {"nb", nb}, {"nq", nq}, {"dim", dim}, {"k", k}, {"metric", metric_name},
-                       {"seed", 42}, {"candidate_fraction", fraction}, {"excluded_fraction", offsets.empty() ? 0 : 1 - fraction},
+                       {"mode", mode}, {"workspace_mb", std::getenv("KNOWHERE_FL_PPU_WORKSPACE_MB") ? std::getenv("KNOWHERE_FL_PPU_WORKSPACE_MB") : "64"},
+                       {"kernel_directory", std::getenv("KNOWHERE_FL_PPU_KERNEL_DIR") ? std::getenv("KNOWHERE_FL_PPU_KERNEL_DIR") : ""},
+                       {"nb", nb}, {"nq", nq}, {"dim", dim}, {"k", k}, {"metric", metric_name},
+                       {"seed", seed}, {"candidate_fraction", fraction}, {"excluded_fraction", offsets.empty() ? 0 : 1 - fraction},
                        {"candidate_distribution", distribution}, {"candidate_count_per_query", offsets.empty() ? nb : offsets[1]},
                        {"device", device}, {"cpu_threads", threads}, {"concurrency", 1}, {"warmup_calls", 2},
                        {"first_call_including_module_load_s", first_s}, {"input_device_allocation_s", allocation_s},

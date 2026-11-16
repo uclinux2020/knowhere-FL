@@ -42,7 +42,7 @@ def distance_scores(XB, XQ, CAND, OFFSETS, SCORES, IDS,
         valid = (col < WIDTH) & (global_col < NB)
     q = vector_load(XQ + query * DIM + d, d < DIM, 0, USE_TLE)
     b = vector_load(XB + ids[:, None] * DIM + d[None, :],
-                    valid[:, None] & (d[None, :] < DIM), 0, USE_TLE)
+                    valid[:, None] & (d[None, :] < DIM), 0, False)
     if METRIC == 0:
         diff = b - q[None, :]
         scores = tl.sum(diff * diff, 1)

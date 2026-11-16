@@ -6,6 +6,7 @@
 #include <hggc.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -116,12 +117,12 @@ struct Kernel {
             hgCtxSetCurrent(previous);
         }
     }
-    void Launch(std::vector<void*> params, unsigned grid, HGstream stream) const {
+    void Launch(std::vector<void*> params, unsigned grid, HGstream stream, unsigned queries = 1) const {
         HGdeviceptr global_scratch = 0, profile_scratch = 0;
         params.push_back(&global_scratch);
         params.push_back(&profile_scratch);
         HGlaunchConfig config{};
-        config.gridDimX = 1;
+        config.gridDimX = queries;
         config.gridDimY = grid;
         config.gridDimZ = 1;
         config.blockDimX = warps * 32;
@@ -132,7 +133,7 @@ struct Kernel {
     }
 };
 struct Bundle {
-    int64_t dim, k, m, ksub, block, select_block;
+    int64_t dim, k, m, ksub, block, select_block, fused_block, queries_per_block;
     int metric;
     std::unordered_map<std::string, std::unique_ptr<Kernel>> kernels;
     explicit Bundle(const std::filesystem::path& root) {
@@ -146,8 +147,12 @@ struct Bundle {
         dim = meta.at("dim"); k = meta.at("k"); metric = meta.at("metric");
         m = meta.at("m"); ksub = meta.at("ksub");
         block = meta.at("block"); select_block = meta.at("select_block");
+        fused_block = meta.value("fused_block", 256);
+        queries_per_block = meta.value("queries_per_block", 1);
         if (dim <= 0 || k <= 0 || 2 * k > select_block || select_block > 65536 || block <= 0 ||
-            (block & (block - 1)) || (select_block & (select_block - 1)) || (metric != 0 && metric != 1)) {
+            (block & (block - 1)) || (select_block & (select_block - 1)) || (metric != 0 && metric != 1) ||
+            (queries_per_block != 1 && queries_per_block != 2 && queries_per_block != 4) ||
+            fused_block <= 0 || (fused_block & (fused_block - 1))) {
             throw std::runtime_error("Invalid PPU retrieval bundle shape");
         }
         for (auto& item : meta.at("kernels").items()) {
@@ -176,11 +181,6 @@ std::shared_ptr<Bundle> Load(int64_t dim, int64_t k, int metric, int64_t m, int6
     if (bundle->dim != dim || bundle->k != k || bundle->metric != metric || bundle->m != m ||
         (m != 0 && bundle->ksub != ksub)) throw std::runtime_error("PPU bundle specialization mismatch");
     return bundle;
-}
-void Select(Bundle& bundle, HGdeviceptr scores, HGdeviceptr ids, HGdeviceptr out_scores,
-            HGdeviceptr out_ids, int64_t width, HGstream stream) {
-    int64_t tiles = 1;
-    bundle.Get("select").Launch({&scores, &ids, &out_scores, &out_ids, &width, &tiles}, 1, stream);
 }
 }  // namespace
 
@@ -276,54 +276,93 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             if (offsets[nq] && !candidates) return -1;
         }
         auto bundle = Load(dim, k, metric, codes ? m : 0, codes ? ksub : 0);
-        const int64_t width_limit = bundle->select_block;
-        Buffer cand(ivf ? static_cast<size_t>(offsets[nq]) * sizeof(int64_t) : 1, stream);
-        Buffer off(2 * sizeof(int64_t), stream);
-        Buffer score(width_limit * sizeof(float), stream), member(width_limit * sizeof(int64_t), stream);
-        Buffer local_score(k * sizeof(float), stream), local_ids(k * sizeof(int64_t), stream);
-        Buffer merge_score(2 * k * sizeof(float), stream), merge_ids(2 * k * sizeof(int64_t), stream);
-        Buffer best_score(k * sizeof(float), stream), best_ids(k * sizeof(int64_t), stream);
-        if (ivf && offsets[nq]) Check(hgMemcpyHtoD(cand.ptr, candidates, offsets[nq] * sizeof(int64_t)));
-        for (int64_t q = 0; q < nq; ++q) {
-            const int64_t count = ivf ? offsets[q + 1] - offsets[q] : nb;
-            if (count == 0) {
-                std::fill_n(ids + q * k, k, -1);
-                std::fill_n(distances + q * k, k, metric == 0 ? std::numeric_limits<float>::infinity() :
-                                                                              -std::numeric_limits<float>::infinity());
-                continue;
+        // Batch query and candidate tiles on the device. Each level is a
+        // single grid launch; never serialize one launch per candidate chunk.
+        int64_t width = nb;
+        if (ivf) {
+            width = 0;
+            for (int64_t q = 0; q < nq; ++q) width = std::max(width, offsets[q + 1] - offsets[q]);
+        }
+        if (width == 0) {
+            std::fill_n(ids, nq * k, -1);
+            std::fill_n(distances, nq * k, metric == 0 ? INFINITY : -INFINITY);
+            return 0;
+        }
+        if (width > 65535 * bundle->block) throw std::runtime_error("PPU score grid exceeds supported width");
+        const std::string fused_name = ivf ? "fused_ivf" : "fused_distance";
+        const bool fused = !codes && bundle->kernels.count(fused_name) != 0;
+        const int64_t local_block = fused ? bundle->fused_block : bundle->select_block;
+        const int64_t tiles = (width + local_block - 1) / local_block;
+        const int64_t compact_width = tiles * k;
+        const uint64_t row_bytes = static_cast<uint64_t>((fused ? 0 : width) + 2 * compact_width) * 12;
+        uint64_t workspace_limit = 64ULL << 20;
+        if (const char* raw = std::getenv("KNOWHERE_FL_PPU_WORKSPACE_MB")) {
+            char* end = nullptr;
+            const auto mb = std::strtoull(raw, &end, 10);
+            if (end == raw || *end != '\0' || *raw == '-' || mb == 0 || mb > 1024) {
+                throw std::runtime_error("KNOWHERE_FL_PPU_WORKSPACE_MB must be in [1, 1024]");
             }
-            if (ivf) Check(hgMemcpyHtoD(off.ptr, offsets + q, 2 * sizeof(int64_t)));
-            HGdeviceptr query = Ptr(xq) + q * dim * sizeof(float);
-            HGdeviceptr base_vectors = Ptr(xb), encoded = Ptr(codes);
-            bool first = true;
-            for (int64_t base = 0; base < count; base += width_limit) {
-                int64_t width = std::min(width_limit, count - base);
-                unsigned grid = static_cast<unsigned>((width + bundle->block - 1) / bundle->block);
-                if (codes) {
-                    bundle->Get("pq").Launch({&base_vectors, &encoded, &query, &cand.ptr, &off.ptr,
-                                              &score.ptr, &member.ptr, &nb, &width, &base}, grid, stream);
-                } else {
-                    bundle->Get(ivf ? "ivf_flat" : "distance").Launch(
-                        {&base_vectors, &query, &cand.ptr, &off.ptr, &score.ptr, &member.ptr, &nb, &width, &base},
-                        grid, stream);
-                }
-                Select(*bundle, score.ptr, member.ptr, local_score.ptr, local_ids.ptr, width, stream);
-                Check(hgStreamSynchronize(stream));
-                if (first) {
-                    Check(hgMemcpyDtoD(best_score.ptr, local_score.ptr, k * sizeof(float)));
-                    Check(hgMemcpyDtoD(best_ids.ptr, local_ids.ptr, k * sizeof(int64_t)));
-                    first = false;
-                } else {
-                    Check(hgMemcpyDtoD(merge_score.ptr, best_score.ptr, k * sizeof(float)));
-                    Check(hgMemcpyDtoD(merge_score.ptr + k * sizeof(float), local_score.ptr, k * sizeof(float)));
-                    Check(hgMemcpyDtoD(merge_ids.ptr, best_ids.ptr, k * sizeof(int64_t)));
-                    Check(hgMemcpyDtoD(merge_ids.ptr + k * sizeof(int64_t), local_ids.ptr, k * sizeof(int64_t)));
-                    Select(*bundle, merge_score.ptr, merge_ids.ptr, best_score.ptr, best_ids.ptr, 2 * k, stream);
-                    Check(hgStreamSynchronize(stream));
-                }
+            workspace_limit = mb << 20;
+        }
+        if (row_bytes > workspace_limit) throw std::runtime_error("PPU workspace budget cannot fit one query");
+        const int64_t batch = std::min<int64_t>(nq, workspace_limit / row_bytes);
+        Buffer candidate_buffer(ivf ? static_cast<size_t>(offsets[nq]) * sizeof(int64_t) : 1, stream);
+        Buffer offset_buffer(ivf ? (nq + 1) * sizeof(int64_t) : 1, stream);
+        Buffer scores(fused ? 1 : batch * width * sizeof(float), stream);
+        Buffer members(fused ? 1 : batch * width * sizeof(int64_t), stream);
+        Buffer compact_a(batch * compact_width * sizeof(float), stream);
+        Buffer ids_a(batch * compact_width * sizeof(int64_t), stream);
+        Buffer compact_b(batch * compact_width * sizeof(float), stream);
+        Buffer ids_b(batch * compact_width * sizeof(int64_t), stream);
+        if (ivf) {
+            if (offsets[nq]) Check(hgMemcpyHtoD(candidate_buffer.ptr, candidates, offsets[nq] * sizeof(int64_t)));
+            Check(hgMemcpyHtoD(offset_buffer.ptr, offsets, (nq + 1) * sizeof(int64_t)));
+        }
+        for (int64_t q = 0; q < nq; q += batch) {
+            unsigned query_count = static_cast<unsigned>(std::min(batch, nq - q));
+            HGdeviceptr query_ptr = Ptr(xq) + q * dim * sizeof(float);
+            HGdeviceptr vectors = Ptr(xb), encoded_codes = Ptr(codes);
+            HGdeviceptr off_ptr = offset_buffer.ptr + (ivf ? q * sizeof(int64_t) : 0);
+            int64_t base = 0;
+            unsigned score_grid = static_cast<unsigned>((width + bundle->block - 1) / bundle->block);
+            int64_t fused_tiles = tiles;
+            if (fused) {
+                bundle->Get(fused_name).Launch({&vectors, &query_ptr, &candidate_buffer.ptr, &off_ptr,
+                                               &compact_a.ptr, &ids_a.ptr, &nb, &width, &fused_tiles},
+                                              static_cast<unsigned>(tiles), stream, query_count);
+            } else if (codes) {
+                bundle->Get("pq").Launch({&vectors, &encoded_codes, &query_ptr, &candidate_buffer.ptr, &off_ptr,
+                                          &scores.ptr, &members.ptr, &nb, &width, &base}, score_grid, stream, query_count);
+            } else if (!ivf && bundle->kernels.count("batched_distance")) {
+                int64_t queries = query_count;
+                bundle->Get("batched_distance").Launch({&vectors, &query_ptr, &scores.ptr, &members.ptr,
+                                                        &nb, &width, &queries}, score_grid, stream,
+                                                       (query_count + bundle->queries_per_block - 1) / bundle->queries_per_block);
+            } else {
+                bundle->Get(ivf ? "ivf_flat" : "distance").Launch(
+                    {&vectors, &query_ptr, &candidate_buffer.ptr, &off_ptr, &scores.ptr, &members.ptr, &nb, &width, &base},
+                    score_grid, stream, query_count);
             }
-            Check(hgMemcpyDtoH(distances + q * k, best_score.ptr, k * sizeof(float)));
-            Check(hgMemcpyDtoH(ids + q * k, best_ids.ptr, k * sizeof(int64_t)));
+            HGdeviceptr in_score = fused ? compact_a.ptr : scores.ptr;
+            HGdeviceptr in_ids = fused ? ids_a.ptr : members.ptr;
+            HGdeviceptr out_score = fused ? compact_b.ptr : compact_a.ptr;
+            HGdeviceptr out_ids = fused ? ids_b.ptr : ids_a.ptr;
+            int64_t input_width = fused ? compact_width : width;
+            bool use_a = !fused;
+            while (true) {
+                int64_t level_tiles = (input_width + bundle->select_block - 1) / bundle->select_block;
+                bundle->Get("select").Launch({&in_score, &in_ids, &out_score, &out_ids, &input_width, &level_tiles},
+                                             static_cast<unsigned>(level_tiles), stream, query_count);
+                if (level_tiles == 1) break;
+                input_width = level_tiles * k;
+                in_score = out_score; in_ids = out_ids;
+                use_a = !use_a;
+                out_score = use_a ? compact_a.ptr : compact_b.ptr;
+                out_ids = use_a ? ids_a.ptr : ids_b.ptr;
+            }
+            Check(hgStreamSynchronize(stream));
+            Check(hgMemcpyDtoH(distances + q * k, out_score, query_count * k * sizeof(float)));
+            Check(hgMemcpyDtoH(ids + q * k, out_ids, query_count * k * sizeof(int64_t)));
         }
         return 0;
     } catch (const std::exception& e) {

@@ -80,6 +80,7 @@ ToSegcoreErrorCode(knowhere::Status status) {
         case knowhere::Status::cuvs_inner_error:
         case knowhere::Status::cardinal_inner_error:
         case knowhere::Status::cuda_runtime_error:
+        case knowhere::Status::fl_device_error:
         case knowhere::Status::cluster_inner_error:
         case knowhere::Status::timeout:
         case knowhere::Status::internal_error:

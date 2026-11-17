@@ -51,6 +51,57 @@ void Verify(const std::vector<float>& xb, const std::vector<float>& xq, int64_t 
         }
     }
 }
+void
+VerifyNestedIvf(int64_t dim, int64_t k, int metric, void* stream) {
+    // Cross both fused-score tiles and multiple select merge levels. Candidate
+    // IDs run backwards so tie resolution cannot accidentally use scan order.
+    constexpr int64_t nb = 2051, nq = 3;
+    std::vector<float> xb(nb * dim, 0), xq(nq * dim, 0), distances(nq * k);
+    std::vector<int64_t> ids(nq * k);
+    xq[dim] = .5f;
+    xq[2 * dim] = 1.f;
+    DeviceBuffer base(xb.size() * sizeof(float)), query(xq.size() * sizeof(float));
+    Require(ppu::CopyH2D(query.ptr, xq.data(), xq.size() * sizeof(float), stream) == 0, "nested query H2D failed");
+    std::vector<int64_t> widths = {0, 1, k - 1, k, 31, 32, 33, 255, 256, 257, 1023, 1024, 1025, nb};
+    std::sort(widths.begin(), widths.end());
+    widths.erase(std::unique(widths.begin(), widths.end()), widths.end());
+    for (bool tied : {false, true}) {
+        for (int64_t id = 0; id < nb; ++id) xb[id * dim] = tied ? 1.f : static_cast<float>(id) * .125f;
+        Require(ppu::CopyH2D(base.ptr, xb.data(), xb.size() * sizeof(float), stream) == 0, "nested base H2D failed");
+        std::vector<std::pair<float, int64_t>> exact;
+        for (int64_t id = 0; id < nb; ++id)
+            exact.emplace_back(Score(xq.data() + 2 * dim, xb.data() + id * dim, dim, metric), id);
+        std::sort(exact.begin(), exact.end(), [metric](auto a, auto b) {
+            return a.first == b.first ? a.second < b.second : metric == 0 ? a.first < b.first : a.first > b.first;
+        });
+        int64_t previous_hits = 0;
+        for (int64_t width : widths) {
+            std::vector<int64_t> candidates;
+            const int64_t short_count = std::min<int64_t>(width, 2);
+            for (int64_t col = 0; col < short_count; ++col) candidates.push_back(nb - 1 - col);
+            for (int64_t col = 0; col < width; ++col) candidates.push_back(nb - 1 - col);
+            std::vector<int64_t> offsets = {0, 0, short_count, short_count + width};
+            Require(ppu::Search(base.ptr, nb, query.ptr, nq, dim, k, metric, candidates.data(), offsets.data(),
+                                distances.data(), ids.data(), stream) == 0,
+                    "nested IVF device search failed");
+            Verify(xb, xq, nb, nq, dim, k, metric, candidates, offsets, distances, ids);
+            int64_t hits = 0;
+            for (int64_t rank = 0; rank < k; ++rank) {
+                for (int64_t t = 0; t < k; ++t) hits += ids[2 * k + rank] == exact[t].second;
+                for (int64_t q = 0; q < nq; ++q) {
+                    if (ids[q * k + rank] == -1) {
+                        Require(metric == 0 ? distances[q * k + rank] > 0 : distances[q * k + rank] < 0,
+                                "IVF padding has wrong metric sign");
+                    }
+                }
+            }
+            Require(hits >= previous_hits, "nested IVF recall decreased");
+            previous_hits = hits;
+            if (width == nb)
+                Require(hits == k, "all-probe IVF is not exact");
+        }
+    }
+}
 int main(int argc, char** argv) {
     try {
         int device = argc > 1 ? std::stoi(argv[1]) : 0;
@@ -73,6 +124,7 @@ int main(int argc, char** argv) {
         Require(ppu::CopyH2D(base.ptr, xb.data(), xb.size() * sizeof(float), stream) == 0, "base H2D failed");
         Require(ppu::CopyH2D(query.ptr, xq.data(), xq.size() * sizeof(float), stream) == 0, "query H2D failed");
         for (int metric : {0, 1}) {
+            VerifyNestedIvf(dim, k, metric, stream);
             Require(ppu::Search(base.ptr, nb, query.ptr, nq, dim, k, metric, nullptr, nullptr,
                                 distances.data(), ids.data(), stream) == 0, "brute-force device search failed");
             Verify(xb, xq, nb, nq, dim, k, metric, {}, {}, distances, ids);

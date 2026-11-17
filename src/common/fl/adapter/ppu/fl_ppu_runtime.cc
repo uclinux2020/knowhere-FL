@@ -308,7 +308,8 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
         const int64_t compact_width = tiles * k;
         const uint64_t row_bytes = (fused ? 0 : static_cast<uint64_t>(width) * (implicit ? 4 : 12)) +
                                    static_cast<uint64_t>(2 * compact_width) * 12 +
-                                   (use_lut ? static_cast<uint64_t>(m * ksub) * sizeof(float) : 0);
+                                   (use_lut ? static_cast<uint64_t>(m * ksub) * sizeof(float) : 0) +
+                                   (ivf ? static_cast<uint64_t>(width) * sizeof(int64_t) + sizeof(int64_t) : 0);
         uint64_t workspace_limit = 64ULL << 20;
         if (const char* raw = std::getenv("KNOWHERE_FL_PPU_WORKSPACE_MB")) {
             char* end = nullptr;
@@ -318,25 +319,36 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             }
             workspace_limit = mb << 20;
         }
-        if (row_bytes > workspace_limit) throw std::runtime_error("PPU workspace budget cannot fit one query");
-        int64_t batch = std::min<int64_t>(nq, workspace_limit / row_bytes);
+        // Include the final CSR offset and worst-case arena alignment in the
+        // IVF budget rather than exceeding the limit at an exact row boundary.
+        const uint64_t overhead = ivf ? sizeof(int64_t) + 9 * 255 : 0;
+        if (row_bytes > workspace_limit - overhead)
+            throw std::runtime_error("PPU workspace budget cannot fit one query");
+        int64_t batch = std::min<int64_t>(nq, (workspace_limit - overhead) / row_bytes);
         // Avoid recomputing masked query lanes at every budget-limited batch
         // boundary. Keep the final partial batch and single-query requests valid.
         if (!ivf && !codes && batch < nq && batch >= bundle->queries_per_block) {
             batch -= batch % bundle->queries_per_block;
         }
+        // Stream CSR in the same query batches as scores. Large requests must
+        // not retain all nq candidate lists on device at once.
+        int64_t max_batch_candidates = 0;
+        if (ivf) {
+            for (int64_t q = 0; q < nq; q += batch) {
+                max_batch_candidates = std::max(max_batch_candidates, offsets[std::min(q + batch, nq)] - offsets[q]);
+            }
+        }
         // One request-owned allocation avoids repeated HG allocator and
         // destructor synchronizations. No cross-request result/data caching.
-        const size_t sizes[] = {
-            ivf ? static_cast<size_t>(offsets[nq]) * sizeof(int64_t) : 1,
-            ivf ? static_cast<size_t>(nq + 1) * sizeof(int64_t) : 1,
-            use_lut ? static_cast<size_t>(batch * m * ksub) * sizeof(float) : 1,
-            fused ? 1 : static_cast<size_t>(batch * width) * sizeof(float),
-            fused || implicit ? 1 : static_cast<size_t>(batch * width) * sizeof(int64_t),
-            static_cast<size_t>(batch * compact_width) * sizeof(float),
-            static_cast<size_t>(batch * compact_width) * sizeof(int64_t),
-            static_cast<size_t>(batch * compact_width) * sizeof(float),
-            static_cast<size_t>(batch * compact_width) * sizeof(int64_t)};
+        const size_t sizes[] = {ivf ? static_cast<size_t>(max_batch_candidates) * sizeof(int64_t) : 1,
+                                ivf ? static_cast<size_t>(batch + 1) * sizeof(int64_t) : 1,
+                                use_lut ? static_cast<size_t>(batch * m * ksub) * sizeof(float) : 1,
+                                fused ? 1 : static_cast<size_t>(batch * width) * sizeof(float),
+                                fused || implicit ? 1 : static_cast<size_t>(batch * width) * sizeof(int64_t),
+                                static_cast<size_t>(batch * compact_width) * sizeof(float),
+                                static_cast<size_t>(batch * compact_width) * sizeof(int64_t),
+                                static_cast<size_t>(batch * compact_width) * sizeof(float),
+                                static_cast<size_t>(batch * compact_width) * sizeof(int64_t)};
         size_t total = 0;
         size_t starts[9];
         for (size_t i = 0; i < 9; ++i) {
@@ -354,10 +366,7 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
         Slice members{workspace.ptr + starts[4]}, compact_a{workspace.ptr + starts[5]};
         Slice ids_a{workspace.ptr + starts[6]}, compact_b{workspace.ptr + starts[7]};
         Slice ids_b{workspace.ptr + starts[8]};
-        if (ivf) {
-            if (offsets[nq]) Check(hgMemcpyHtoD(candidate_buffer.ptr, candidates, offsets[nq] * sizeof(int64_t)));
-            Check(hgMemcpyHtoD(offset_buffer.ptr, offsets, (nq + 1) * sizeof(int64_t)));
-        }
+        std::vector<int64_t> batch_offsets(ivf ? static_cast<size_t>(batch + 1) : 0);
         std::unique_ptr<Buffer> packed;
         HGdeviceptr search_vectors = Ptr(xb);
         if (!ivf && !codes && bundle->kernels.count("transpose_base")) {
@@ -392,12 +401,35 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             }
         } events(profile);
         double score_ms = 0, select_ms = 0;
+        uint64_t scored_slots = 0;
+        const int64_t request_width = width;
         for (int64_t q = 0; q < nq; q += batch) {
-            if (profile) Check(hgEventRecord(events.begin, stream));
             unsigned query_count = static_cast<unsigned>(std::min(batch, nq - q));
+            int64_t width = request_width;
+            if (ivf) {
+                width = 0;
+                for (unsigned i = 0; i < query_count; ++i) {
+                    width = std::max(width, offsets[q + i + 1] - offsets[q + i]);
+                }
+                if (width == 0) {
+                    std::fill_n(ids + q * k, query_count * k, -1);
+                    std::fill_n(distances + q * k, query_count * k, metric == 0 ? INFINITY : -INFINITY);
+                    continue;
+                }
+                const int64_t first = offsets[q], count = offsets[q + query_count] - first;
+                for (unsigned i = 0; i <= query_count; ++i) batch_offsets[i] = offsets[q + i] - first;
+                if (count)
+                    Check(hgMemcpyHtoD(candidate_buffer.ptr, candidates + first, count * sizeof(int64_t)));
+                Check(hgMemcpyHtoD(offset_buffer.ptr, batch_offsets.data(), (query_count + 1) * sizeof(int64_t)));
+            }
+            if (profile)
+                Check(hgEventRecord(events.begin, stream));
+            scored_slots += static_cast<uint64_t>(query_count) * width;
+            const int64_t tiles = (width + local_block - 1) / local_block;
+            const int64_t compact_width = tiles * k;
             HGdeviceptr query_ptr = Ptr(xq) + q * dim * sizeof(float);
             HGdeviceptr vectors = search_vectors, encoded_codes = Ptr(codes);
-            HGdeviceptr off_ptr = offset_buffer.ptr + (ivf ? q * sizeof(int64_t) : 0);
+            HGdeviceptr off_ptr = offset_buffer.ptr;
             int64_t base = 0;
             unsigned score_grid = static_cast<unsigned>((width + bundle->block - 1) / bundle->block);
             int64_t fused_tiles = tiles;
@@ -459,8 +491,11 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             Check(hgMemcpyDtoH(distances + q * k, out_score, query_count * k * sizeof(float)));
             Check(hgMemcpyDtoH(ids + q * k, out_ids, query_count * k * sizeof(int64_t)));
         }
-        if (profile) std::cerr << "PPU_PROFILE score_ms=" << score_ms << " select_ms=" << select_ms
-                               << " query_batch=" << batch << '\n';
+        if (profile)
+            std::cerr << "PPU_PROFILE score_ms=" << score_ms << " select_ms=" << select_ms << " query_batch=" << batch
+                      << " candidate_count=" << (ivf ? offsets[nq] : 0) << " candidate_width=" << width
+                      << " workspace_bytes=" << total << " candidate_device_bytes=" << (ivf ? sizes[0] + sizes[1] : 0)
+                      << " scored_slots=" << scored_slots << '\n';
         return 0;
     } catch (const std::exception& e) {
         // Never free workspace while a failed launch chain may still use it.

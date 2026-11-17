@@ -30,7 +30,7 @@ FlagOS 是多算子库生态，**不等于 FlagGems**。FlagTree 是编译链；
 - Triton-TLE：向量加载实际使用 `tle.load(..., is_async=True)`，不是仅添加名称标签。
 - CAGRA 图遍历：`graph_search == nullptr`，保留 CPU 回退，**未实现 PPU 图遍历**。
 
-初版按query顺序处理score chunks；2026-11-16优化改为query/candidate二维grid、分批score及设备分层top-k，默认以64MiB score/compact目标控制query batch（candidate CSR另计）。详见 [性能差距分析与优化](ppu-optimization-20261116.md)。不支持非零 global/profile scratch、clustered CTA；不兼容产物明确拒绝。CUDA-named `GPUTarget('cuda', 80, 32)` 是本机 PPU FlagTree plugin 的内部 target 标识；通过 `FLAGTREE_BACKEND=ppu` 选择实际 PPU 编译器，并强制检查输出为 `hgbin`。
+初版按query顺序处理score chunks；2026-11-16优化改为query/candidate二维grid、分批score及设备分层top-k，默认以64MiB score/compact目标控制query batch。2026-11-17起IVF/PQ将分批candidate CSR、offset及arena对齐开销一并纳入该预算，不再一次上传全请求CSR。详见 [性能差距分析与优化](ppu-optimization-20261116.md)。不支持非零 global/profile scratch、clustered CTA；不兼容产物明确拒绝。CUDA-named `GPUTarget('cuda', 80, 32)` 是本机 PPU FlagTree plugin 的内部 target 标识；通过 `FLAGTREE_BACKEND=ppu` 选择实际 PPU 编译器，并强制检查输出为 `hgbin`。
 
 ## 编译库
 
@@ -110,6 +110,14 @@ Search将临时设备缓冲合并为一次对齐arena分配，仍在请求结束
 `--compact-score`仅支持矩阵转置配置的k1：tile内求最优score/ID后才写全局内存，
 避免完整score表物化。百万/nq200请求从11.51ms降至8.25ms；k10融合发生退化，未启用。
 完整精度、显存取舍与退化样本见 [局部top-1报告](ppu-compact-top1-20261116.md)。
+
+## IVF/PQ 候选分批与探针正确性
+
+IVF/PQ 的候选 CSR 按 query batch 上传，并按批次实际最大候选宽度执行；空批次不 launch。
+候选、offset 和 arena 对齐计入工作区预算，profile 输出实际候选数量及矩形 score 槽位。
+同时修复 IVF host 路由的质心 tie-break、CPU fallback 的 ID tie-break 与不足 k 的 padding 顺序。
+百万向量不均衡候选/4MiB 场景延迟下降约11%，均匀候选持平；完整边界见
+[Milvus E2E 后续优化记录](ppu-e2e-followup-20261117.md)。
 
 ## 独立真实设备测试（无完整 Conan graph）
 

@@ -230,6 +230,108 @@ TEST_CASE("FL_IVF_FLAT build/search recall on clustered data", "[fl]") {
     knowhere::fl::UnregisterHostAdapter();
 }
 
+TEST_CASE("FL_IVF_FLAT tied probes remain nested and full probes are exact", "[fl][ivf-nprobe]") {
+    // A serialized fixture makes routing ties reproducible without depending on kmeans training.
+    struct RestoreDeviceOps {
+        const knowhere::fl::FlDeviceOps* saved = knowhere::fl::GetDeviceOps();
+        RestoreDeviceOps() {
+            knowhere::fl::RegisterDeviceOps(nullptr);
+        }
+        ~RestoreDeviceOps() {
+            knowhere::fl::RegisterDeviceOps(saved);
+        }
+    } restore_device_ops;
+    constexpr int64_t nb = 15, dim = 1, nlist = 15;
+    const float route[] = {2, 1, 1, 0, 2, 1, 2, 1, 2, 1, 1, 2, 0, 0, 1};
+    for (bool is_ip : {false, true}) {
+        const int metric = is_ip ? 1 : 0;
+        const std::string metric_name = is_ip ? "IP" : "L2";
+        for (bool tied_vectors : {false, true}) {
+            CAPTURE(metric_name, tied_vectors);
+            std::vector<float> xb(nb), centroids(nb);
+            float q = is_ip ? 1.f : 0.f;
+            for (int64_t id = 0; id < nb; ++id) {
+                centroids[id] = is_ip ? -route[id] : std::sqrt(route[id]);
+                float value = tied_vectors ? static_cast<float>(id % 3) : static_cast<float>(id + 1);
+                if (id == 5)
+                    value = 0.f;  // This neighbor used to disappear between probes 5 and 6.
+                xb[id] = is_ip ? -value : value;
+            }
+            knowhere::MemoryIOWriter writer;
+            knowhere::fl::WriteFormatHeader(writer);
+            writer(&dim, sizeof(dim), 1);
+            writer(&nb, sizeof(nb), 1);
+            writer(&nlist, sizeof(nlist), 1);
+            writer(&metric, sizeof(metric), 1);
+            writer(centroids.data(), sizeof(float), centroids.size());
+            writer(xb.data(), sizeof(float), xb.size());
+            for (int64_t id = 0; id < nb; ++id) {
+                const int64_t size = 1;
+                writer(&size, sizeof(size), 1);
+                writer(&id, sizeof(id), 1);
+            }
+            knowhere::BinarySet binset;
+            binset.Append(knowhere::IndexEnum::INDEX_FL_IVFFLAT, std::shared_ptr<uint8_t[]>(writer.data()),
+                          writer.tellg());
+            auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
+            knowhere::Json cfg = {{"metric_type", metric_name}, {"dim", dim}, {"nlist", nlist}};
+            REQUIRE(idx.Deserialize(binset, cfg) == knowhere::Status::success);
+            auto query = knowhere::GenDataSet(1, dim, &q);
+            std::set<int64_t> previous;
+            int64_t previous_hits = 0;
+            std::vector<std::pair<float, int64_t>> exact;
+            for (int64_t id = 0; id < nb; ++id) {
+                exact.emplace_back(is_ip ? q * xb[id] : xb[id] * xb[id], id);
+            }
+            auto better = [is_ip](const auto& a, const auto& b) {
+                return a.first == b.first ? a.second < b.second : is_ip ? a.first > b.first : a.first < b.first;
+            };
+            std::sort(exact.begin(), exact.end(), better);
+            for (int64_t nprobe = 1; nprobe <= nlist; ++nprobe) {
+                CAPTURE(nprobe);
+                knowhere::Json search = {{"metric_type", metric_name}, {"k", nb}, {"nprobe", nprobe}};
+                auto candidates = idx.Search(query, search, nullptr);
+                REQUIRE(candidates.has_value());
+                std::set<int64_t> current;
+                for (int64_t rank = 0; rank < nb; ++rank) {
+                    const int64_t id = candidates.value()->GetIds()[rank];
+                    if (rank < nprobe) {
+                        REQUIRE(id >= 0);
+                        REQUIRE(current.insert(id).second);
+                    } else {
+                        REQUIRE(id == -1);
+                    }
+                }
+                REQUIRE(std::includes(current.begin(), current.end(), previous.begin(), previous.end()));
+                previous = current;
+                std::vector<std::pair<float, int64_t>> truth;
+                for (const auto& candidate : exact) {
+                    if (current.count(candidate.second))
+                        truth.push_back(candidate);
+                }
+                search["k"] = 3;
+                auto result = idx.Search(query, search, nullptr);
+                REQUIRE(result.has_value());
+                int64_t hits = 0;
+                for (int64_t rank = 0; rank < 3; ++rank) {
+                    const int64_t id = result.value()->GetIds()[rank];
+                    if (rank < static_cast<int64_t>(truth.size())) {
+                        REQUIRE(id == truth[rank].second);
+                        REQUIRE(result.value()->GetDistance()[rank] == Catch::Approx(truth[rank].first));
+                    } else {
+                        REQUIRE(id == -1);
+                    }
+                    for (int64_t t = 0; t < 3; ++t) hits += id == exact[t].second;
+                }
+                REQUIRE(hits >= previous_hits);
+                previous_hits = hits;
+                if (nprobe == nlist)
+                    REQUIRE(hits == 3);
+            }
+        }
+    }
+}
+
 TEST_CASE("FL_IVF_FLAT serialize/deserialize round trip", "[fl]") {
     knowhere::fl::UnregisterHostAdapter();
     auto base = GenDataSet(kNb, kDim, 42);

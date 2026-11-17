@@ -576,10 +576,11 @@ class FlIvfFlatIndexNode : public IndexNode {
                 scores[l] = {metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot), l};
             }
             const bool is_ip = metric_code_ == 1;
-            std::partial_sort(scores.begin(), scores.begin() + nprobe, scores.end(),
-                              [is_ip](const auto& a, const auto& b) {
-                                  return is_ip ? (a.first > b.first) : (a.first < b.first);
-                              });
+            std::partial_sort(
+                scores.begin(), scores.begin() + nprobe, scores.end(), [is_ip](const auto& a, const auto& b) {
+                    // A total order keeps probe prefixes nested even when centroids tie.
+                    return a.first == b.first ? a.second < b.second : is_ip ? a.first > b.first : a.first < b.first;
+                });
             auto& pl = probes[i];
             for (int64_t p = 0; p < nprobe; ++p) {
                 pl.push_back(scores[p].second);
@@ -614,7 +615,8 @@ class FlIvfFlatIndexNode : public IndexNode {
             // instead of collecting every candidate then partial_sort.
             using Cand = std::pair<float, int64_t>;
             auto cmp = [is_ip](const Cand& a, const Cand& b) {
-                return is_ip ? (a.first > b.first) : (a.first < b.first);
+                // Match device selection: lower global ID wins equal scores.
+                return a.first == b.first ? a.second < b.second : is_ip ? a.first > b.first : a.first < b.first;
             };
             std::priority_queue<Cand, std::vector<Cand>, decltype(cmp)> heap(cmp);
             const float* q = xq + i * dim_;
@@ -639,23 +641,22 @@ class FlIvfFlatIndexNode : public IndexNode {
                 if (static_cast<int64_t>(heap.size()) < k) {
                     heap.emplace(dist, id);
                 } else {
-                    const float worst = heap.top().first;
-                    if ((is_ip && dist > worst) || (!is_ip && dist < worst)) {
+                    if (cmp(Cand{dist, id}, heap.top())) {
                         heap.pop();
                         heap.emplace(dist, id);
                     }
                 }
             }
-            for (int64_t t = k - 1; t >= 0; --t) {
-                if (heap.empty()) {
-                    distances[i * k + t] =
-                        is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
-                    ids[i * k + t] = -1;
-                } else {
-                    distances[i * k + t] = heap.top().first;
-                    ids[i * k + t] = heap.top().second;
-                    heap.pop();
-                }
+            const int64_t count = static_cast<int64_t>(heap.size());
+            // Write missing neighbors after the valid sorted prefix, not before it.
+            for (int64_t t = count; t < k; ++t) {
+                distances[i * k + t] = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+                ids[i * k + t] = -1;
+            }
+            for (int64_t t = count - 1; t >= 0; --t) {
+                distances[i * k + t] = heap.top().first;
+                ids[i * k + t] = heap.top().second;
+                heap.pop();
             }
         }
     }

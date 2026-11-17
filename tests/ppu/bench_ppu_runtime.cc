@@ -114,17 +114,21 @@ Json Summary(std::vector<double> times, int64_t nq) {
 int main(int argc, char** argv) {
     try {
         // output mode nb nq dim k metric candidate_fraction distribution iterations threads device
-        if (argc != 13) throw std::runtime_error("Args: output bf|ivf|pq|assign nb nq dim k L2|IP fraction random|clustered iters threads device");
+        if (argc != 13)
+            throw std::runtime_error(
+                "Args: output bf|ivf|pq|assign nb nq dim k L2|IP fraction random|clustered|skewed iters threads "
+                "device");
         std::string output = argv[1], mode = argv[2], distribution = argv[9];
         int64_t nb = std::stoll(argv[3]), nq = std::stoll(argv[4]), dim = std::stoll(argv[5]), k = std::stoll(argv[6]);
         std::string metric_name = argv[7];
         int metric = metric_name == "L2" ? 0 : 1;
         double fraction = std::stod(argv[8]);
         int iters = std::stoi(argv[10]), threads = std::stoi(argv[11]), device = std::stoi(argv[12]);
-        Require(nb > 0 && nq > 0 && dim > 0 && k > 0 && k <= nb && iters >= 3 && threads > 0 &&
-                fraction >= 0 && fraction <= 1 && (metric_name == "L2" || metric_name == "IP") &&
-                (mode == "bf" || mode == "ivf" || mode == "pq" || mode == "assign") &&
-                (distribution == "random" || distribution == "clustered"), "Invalid benchmark configuration");
+        Require(nb > 0 && nq > 0 && dim > 0 && k > 0 && k <= nb && iters >= 3 && threads > 0 && fraction >= 0 &&
+                    fraction <= 1 && (metric_name == "L2" || metric_name == "IP") &&
+                    (mode == "bf" || mode == "ivf" || mode == "pq" || mode == "assign") &&
+                    (distribution == "random" || distribution == "clustered" || distribution == "skewed"),
+                "Invalid benchmark configuration");
         Require(mode != "assign" || k == 1, "Assign requires k=1");
         omp_set_dynamic(0); omp_set_num_threads(threads);
         Require(ppu::SetDevice(device) == 0, "PPU context binding failed");
@@ -142,9 +146,13 @@ int main(int argc, char** argv) {
             offsets.push_back(0);
             std::vector<int64_t> perm(nb); std::iota(perm.begin(), perm.end(), 0);
             for (int64_t q = 0; q < nq; ++q) {
-                if (distribution == "random") std::shuffle(perm.begin(), perm.end(), rng);
+                if (distribution != "clustered")
+                    std::shuffle(perm.begin(), perm.end(), rng);
                 else std::iota(perm.begin(), perm.end(), 0);
-                cand.insert(cand.end(), perm.begin(), perm.begin() + nc);
+                // Cluster short lists before a long-list tail to expose global
+                // width padding and CSR batch origins without changing nb.
+                const int64_t count = distribution == "skewed" && q < nq * 3 / 4 ? nc / 100 : nc;
+                cand.insert(cand.end(), perm.begin(), perm.begin() + count);
                 offsets.push_back(cand.size());
             }
         }
@@ -245,13 +253,27 @@ int main(int argc, char** argv) {
         }
         Json correctness = Compare(truth, actual, nq, k);
         Json cpu = Summary(cpu_times, nq), ppu_times = Summary(times, nq);
+        int64_t min_candidates = nb, max_candidates = nb;
+        const int64_t total_candidates = offsets.empty() ? nb * nq : offsets.back();
+        if (!offsets.empty()) {
+            min_candidates = nb;
+            max_candidates = 0;
+            for (int64_t q = 0; q < nq; ++q) {
+                const int64_t count = offsets[q + 1] - offsets[q];
+                min_candidates = std::min(min_candidates, count);
+                max_candidates = std::max(max_candidates, count);
+            }
+        }
+        const double mean_candidates = static_cast<double>(total_candidates) / nq;
         struct rusage usage{}; getrusage(RUSAGE_SELF, &usage);
         Json report = {{"schema", 1}, {"path", legacy_path ? "historical CUDA-C artifact via native HG (comparison only)" : "FlagOS Triton with Triton-TLE -> FlagTree AOT -> native HG -> PPU"},
                        {"mode", mode}, {"workspace_mb", std::getenv("KNOWHERE_FL_PPU_WORKSPACE_MB") ? std::getenv("KNOWHERE_FL_PPU_WORKSPACE_MB") : "64"},
                        {"kernel_directory", std::getenv("KNOWHERE_FL_PPU_KERNEL_DIR") ? std::getenv("KNOWHERE_FL_PPU_KERNEL_DIR") : ""},
                        {"nb", nb}, {"nq", nq}, {"dim", dim}, {"k", k}, {"metric", metric_name},
-                       {"seed", seed}, {"candidate_fraction", fraction}, {"excluded_fraction", offsets.empty() ? 0 : 1 - fraction},
-                       {"candidate_distribution", distribution}, {"candidate_count_per_query", offsets.empty() ? nb : offsets[1]},
+                       {"seed", seed}, {"candidate_fraction", fraction}, {"excluded_fraction", 1 - mean_candidates / nb},
+                       {"candidate_distribution", distribution}, {"candidate_count_per_query", mean_candidates},
+                       {"candidate_count_min", min_candidates}, {"candidate_count_max", max_candidates},
+                       {"candidate_count_total", total_candidates},
                        {"device", device}, {"cpu_threads", threads}, {"concurrency", 1}, {"warmup_calls", 2},
                        {"first_call_including_module_load_s", first_s}, {"input_device_allocation_s", allocation_s},
                        {"input_h2d_s", stage_s}, {"cpu_reference", cpu}, {"ppu_search", ppu_times},

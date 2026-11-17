@@ -278,6 +278,81 @@ TEST_CASE("FL_IVF_FLAT full scan preserves filters padding and device failure fa
     knowhere::fl::RegisterDeviceOps(nullptr);
 }
 
+TEST_CASE("FL_IVF_FLAT large CSR copy preserves candidate order across thread limits", "[fl][ivf-csr]") {
+    knowhere::fl::GetDeviceOps();
+    knowhere::fl::RegisterDeviceOps(nullptr);
+    REQUIRE(knowhere::fl::RegisterHostAdapter());
+    const auto* host_ops = knowhere::fl::GetDeviceOps();
+    struct Restore {
+        const knowhere::fl::FlDeviceOps* ops;
+        int threads = omp_get_max_threads();
+        ~Restore() {
+            omp_set_num_threads(threads);
+            knowhere::fl::RegisterDeviceOps(ops);
+        }
+    } restore{host_ops};
+    static std::vector<int64_t> captured_ids, captured_offsets;
+    auto capture_ops = *host_ops;
+    capture_ops.ivf_flat_scan = [](const void*, int64_t, int64_t, const void*, int64_t nq, const int64_t* ids,
+                                   const int64_t* offsets, int64_t k, int, float* scores, int64_t* results, void*) {
+        captured_ids.assign(ids, ids + offsets[nq]);
+        captured_offsets.assign(offsets, offsets + nq + 1);
+        std::fill_n(scores, nq * k, 0.f);
+        std::fill_n(results, nq * k, -1);
+        return 0;
+    };
+    // The adapter outlives all buffers owned by the node.
+    knowhere::fl::RegisterDeviceOps(&capture_ops);
+    constexpr int64_t nb = 16384, nq = 100, dim = 1, nlist = 8;
+    std::vector<float> centroids(nlist), xb(nb), queries(nq, 0.f);
+    std::iota(centroids.begin(), centroids.end(), 0.f);
+    knowhere::MemoryIOWriter writer;
+    knowhere::fl::WriteFormatHeader(writer);
+    writer(&dim, sizeof(dim), 1);
+    writer(&nb, sizeof(nb), 1);
+    writer(&nlist, sizeof(nlist), 1);
+    const int32_t metric = 0;
+    writer(&metric, sizeof(metric), 1);
+    writer(centroids.data(), sizeof(float), centroids.size());
+    writer(xb.data(), sizeof(float), xb.size());
+    for (int64_t list = 0; list < nlist; ++list) {
+        const int64_t count = nb / nlist;
+        writer(&count, sizeof(count), 1);
+        for (int64_t id = list; id < nb; id += nlist) writer(&id, sizeof(id), 1);
+    }
+    knowhere::BinarySet binary;
+    binary.Append(knowhere::IndexEnum::INDEX_FL_IVFFLAT, std::shared_ptr<uint8_t[]>(writer.data()), writer.tellg());
+    auto index = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
+    REQUIRE(index.Deserialize(binary, {{"metric_type", "L2"}, {"dim", dim}, {"nlist", nlist}}) ==
+            knowhere::Status::success);
+    auto query = knowhere::GenDataSet(nq, dim, queries.data());
+    // Probe 5 is below the parallel threshold; probe 6 is above it.
+    for (int64_t probe : {5, 6}) {
+        const knowhere::Json config = {{"metric_type", "L2"}, {"k", 1}, {"nprobe", probe}};
+        omp_set_num_threads(1);
+        REQUIRE(index.Search(query, config, nullptr).has_value());
+        const auto serial_ids = captured_ids;
+        const auto serial_offsets = captured_offsets;
+        REQUIRE(serial_ids.size() == static_cast<size_t>(nq * probe * nb / nlist));
+        for (int threads : {2, 8, 88}) {
+            omp_set_num_threads(threads);
+            REQUIRE(index.Search(query, config, nullptr).has_value());
+            REQUIRE(captured_ids == serial_ids);
+            REQUIRE(captured_offsets == serial_offsets);
+        }
+        for (int64_t q = 0; q < nq; ++q) {
+            const auto first = serial_offsets[q];
+            for (int64_t list = 0; list < probe; ++list) {
+                for (int64_t row = 0; row < nb / nlist; ++row) {
+                    if (serial_ids[first + list * (nb / nlist) + row] != row * nlist + list) {
+                        FAIL("CSR member order changed");
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("FL_IVF_FLAT tied probes remain nested and full probes are exact", "[fl][ivf-nprobe]") {
     // A serialized fixture makes routing ties reproducible without depending on kmeans training.
     struct RestoreDeviceOps {

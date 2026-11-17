@@ -12,6 +12,8 @@
 #ifndef KNOWHERE_FL_IVF_FLAT_NODE_H
 #define KNOWHERE_FL_IVF_FLAT_NODE_H
 
+#include <omp.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -662,7 +664,10 @@ class FlIvfFlatIndexNode : public IndexNode {
                 cand_offsets[i + 1] = cand_offsets[i] + count;
             }
             cand_ids.resize(static_cast<size_t>(cand_offsets[nq]));
-#pragma omp parallel for schedule(static) if(cand_offsets[nq] >= 1048576 && nq > 1)
+            // CSR copying is bandwidth-bound. A full machine-wide OpenMP team
+            // adds scheduling cost and contention without more useful bandwidth.
+            const int copy_threads = static_cast<int>(std::min<int64_t>({nq, omp_get_max_threads(), 8}));
+#pragma omp parallel for schedule(static) num_threads(copy_threads) if (cand_offsets[nq] >= 1048576 && copy_threads > 1)
             for (int64_t i = 0; i < nq; ++i) {
                 auto position = cand_offsets[i];
                 for (const int64_t l : probes[i]) {

@@ -119,6 +119,13 @@ IVF/PQ 的候选 CSR 按 query batch 上传，并按批次实际最大候选宽�
 百万向量不均衡候选/4MiB 场景延迟下降约11%，均匀候选持平；完整边界见
 [Milvus E2E 后续优化记录](ppu-e2e-followup-20261117.md)。
 
+## R2 运行配置纠偏与候选拷贝线程限制
+
+R2 原始日志显示 `KNOWHERE_FL_PPU_KERNEL_DIR` 未设置，搜索实际回退 CPU，不能将其延迟归因为 PPU 或每请求全量 xb H2D。
+当前 xb 已在 Add/Deserialize 常驻；本轮只将无过滤大 CSR 拷贝 team 限制为最多8线程。
+88线程配置的百万固定输入 host-only ABBA 测量，nprobe4/16延迟下降约35%/31%；不是新的 Milvus E2E 加速成绩。
+证据、完整回归及未验证边界见 [R2 后续优化记录](ppu-r2-followup-20261117.md)。
+
 ## 独立真实设备测试（无完整 Conan graph）
 
 需 FlagTree PPU Python 和 nlohmann/json C++ 头文件（不需要 Torch 或 NumPy）。从仓库根目录执行：

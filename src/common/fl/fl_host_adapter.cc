@@ -97,7 +97,7 @@ host_topk_over_candidates(const float* xb, int64_t dim, const float* xq, int64_t
         // (same selection pattern as the nodes' CPU fallback paths)
         using Cand = std::pair<float, int64_t>;
         auto cmp = [is_ip](const Cand& a, const Cand& b) {
-            return is_ip ? (a.first > b.first) : (a.first < b.first);
+            return a.first == b.first ? a.second < b.second : is_ip ? a.first > b.first : a.first < b.first;
         };
         std::priority_queue<Cand, std::vector<Cand>, decltype(cmp)> heap(cmp);
         // query norm is loop-invariant; compute once per query
@@ -122,22 +122,21 @@ host_topk_over_candidates(const float* xb, int64_t dim, const float* xq, int64_t
             if (static_cast<int64_t>(heap.size()) < k) {
                 heap.emplace(dist, id);
             } else {
-                const float worst = heap.top().first;
-                if ((is_ip && dist > worst) || (!is_ip && dist < worst)) {
+                if (cmp(Cand{dist, id}, heap.top())) {
                     heap.pop();
                     heap.emplace(dist, id);
                 }
             }
         }
-        for (int64_t t = k - 1; t >= 0; --t) {
-            if (heap.empty()) {
-                out_dist[i * k + t] = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
-                out_ids[i * k + t] = -1;
-            } else {
-                out_dist[i * k + t] = heap.top().first;
-                out_ids[i * k + t] = heap.top().second;
-                heap.pop();
-            }
+        const int64_t count = static_cast<int64_t>(heap.size());
+        for (int64_t t = count; t < k; ++t) {
+            out_dist[i * k + t] = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+            out_ids[i * k + t] = -1;
+        }
+        for (int64_t t = count - 1; t >= 0; --t) {
+            out_dist[i * k + t] = heap.top().first;
+            out_ids[i * k + t] = heap.top().second;
+            heap.pop();
         }
     }
 }
@@ -289,7 +288,7 @@ host_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, c
         using Cand = std::pair<float, int64_t>;
         const bool is_ip = (metric == 1);
         auto cmp = [is_ip](const Cand& a, const Cand& b) {
-            return is_ip ? (a.first > b.first) : (a.first < b.first);
+            return a.first == b.first ? a.second < b.second : is_ip ? a.first > b.first : a.first < b.first;
         };
         std::priority_queue<Cand, std::vector<Cand>, decltype(cmp)> heap(cmp);
         for (int64_t c = cand_offsets[i]; c < cand_offsets[i + 1]; ++c) {
@@ -302,22 +301,21 @@ host_ivf_pq_scan(const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, c
             if (static_cast<int64_t>(heap.size()) < k) {
                 heap.emplace(dist, id);
             } else {
-                const float worst = heap.top().first;
-                if ((is_ip && dist > worst) || (!is_ip && dist < worst)) {
+                if (cmp(Cand{dist, id}, heap.top())) {
                     heap.pop();
                     heap.emplace(dist, id);
                 }
             }
         }
-        for (int64_t t = k - 1; t >= 0; --t) {
-            if (heap.empty()) {
-                out_dist[i * k + t] = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
-                out_ids[i * k + t] = -1;
-            } else {
-                out_dist[i * k + t] = heap.top().first;
-                out_ids[i * k + t] = heap.top().second;
-                heap.pop();
-            }
+        const int64_t count = static_cast<int64_t>(heap.size());
+        for (int64_t t = count; t < k; ++t) {
+            out_dist[i * k + t] = is_ip ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+            out_ids[i * k + t] = -1;
+        }
+        for (int64_t t = count - 1; t >= 0; --t) {
+            out_dist[i * k + t] = heap.top().first;
+            out_ids[i * k + t] = heap.top().second;
+            heap.pop();
         }
     }
     return 0;

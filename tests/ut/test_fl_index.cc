@@ -235,6 +235,49 @@ TEST_CASE("FL_IVF_FLAT build/search recall on clustered data", "[fl]") {
     knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
 }
 
+TEST_CASE("FL_IVF_FLAT full scan preserves filters padding and device failure fallback", "[fl][ivf-full]") {
+    knowhere::fl::GetDeviceOps();
+    knowhere::fl::RegisterDeviceOps(nullptr);
+    REQUIRE(knowhere::fl::RegisterHostAdapter());
+    const auto* host_ops = knowhere::fl::GetDeviceOps();
+    auto base = GenDataSet(67, 16, 42);
+    auto query = GenDataSet(3, 16, 7);
+    for (const std::string metric : {"L2", "IP"}) {
+        auto index = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
+        REQUIRE(index.Build(base, {{"metric_type", metric}, {"dim", 16}, {"nlist", 8}}) == knowhere::Status::success);
+        for (int64_t k : {1, 10, 70}) {
+            CAPTURE(metric, k);
+            const knowhere::Json cfg = {{"metric_type", metric}, {"k", k}, {"nprobe", 8}};
+            auto device = index.Search(query, cfg, nullptr);
+            REQUIRE(device.has_value());
+            // A failed BF specialization must rebuild candidates and scan CPU.
+            auto failed_ops = *host_ops;
+            failed_ops.brute_force_topk = [](const void*, int64_t, const void*, int64_t, int64_t, int64_t, int,
+                                              float*, int64_t*, void*) { return -1; };
+            knowhere::fl::RegisterDeviceOps(&failed_ops);
+            auto fallback = index.Search(query, cfg, nullptr);
+            knowhere::fl::RegisterDeviceOps(host_ops);
+            REQUIRE(fallback.has_value());
+            for (int64_t q = 0; q < 3; ++q) {
+                for (int64_t rank = 0; rank < k; ++rank) {
+                    REQUIRE(device.value()->GetIds()[q * k + rank] == fallback.value()->GetIds()[q * k + rank]);
+                    if (rank >= 67) REQUIRE(device.value()->GetIds()[q * k + rank] == -1);
+                }
+            }
+            std::vector<uint8_t> bits((67 + 7) / 8, 0xff);
+            bits[0] &= ~uint8_t(1);  // Only row zero remains eligible.
+            bits.back() &= uint8_t(0x07);  // Padding bits are outside the 67-row filter.
+            auto filtered = index.Search(query, cfg, knowhere::BitsetView(bits.data(), 67));
+            REQUIRE(filtered.has_value());
+            for (int64_t q = 0; q < 3; ++q) {
+                REQUIRE(filtered.value()->GetIds()[q * k] == 0);
+                for (int64_t rank = 1; rank < k; ++rank) REQUIRE(filtered.value()->GetIds()[q * k + rank] == -1);
+            }
+        }
+    }
+    knowhere::fl::RegisterDeviceOps(nullptr);
+}
+
 TEST_CASE("FL_IVF_FLAT tied probes remain nested and full probes are exact", "[fl][ivf-nprobe]") {
     // A serialized fixture makes routing ties reproducible without depending on kmeans training.
     struct RestoreDeviceOps {

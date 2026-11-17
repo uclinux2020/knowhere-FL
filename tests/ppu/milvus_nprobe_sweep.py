@@ -61,10 +61,13 @@ def main():
                 for _ in range(2):
                     coll.search(query, "vec", params, 10, timeout=180)
                 samples = []
+                windows = []
                 for _ in range(args.repeats):
+                    wall_start_us = time.time_ns() // 1000
                     begin = time.perf_counter()
                     result = coll.search(query, "vec", params, 10, timeout=180)
                     samples.append(time.perf_counter() - begin)
+                    windows.append([wall_start_us, time.time_ns() // 1000])
                 ids = [[hit.id for hit in hits] for hits in result]
                 if truth is None:
                     truth = ids
@@ -73,7 +76,8 @@ def main():
                 regressions = sum(a < b for a, b in zip(per_query_hits, prior_hits)) if prior_hits else 0
                 prior_hits = per_query_hits
                 row = {"index": index, "nprobe": probe, "build_s": build_s,
-                       "samples_s": samples, "batch_p50_ms": float(np.median(samples) * 1000),
+                       "samples_s": samples, "request_windows_us": windows,
+                       "batch_p50_ms": float(np.median(samples) * 1000),
                        "qps": args.nq / float(np.median(samples)), "recall_at_10": recall,
                        "ordered_align": sum(a == b for g, t in zip(truth, ids) for a, b in zip(g, t)) / (args.nq * 10),
                        "per_query_hits": per_query_hits, "recall_regression_queries": regressions,

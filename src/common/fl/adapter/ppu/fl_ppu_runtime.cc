@@ -6,6 +6,7 @@
 #include <hggc.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -14,12 +15,12 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
+#include <syncstream>
 #include <unordered_map>
 #include <vector>
-
-#include <nlohmann/json.hpp>
 
 namespace knowhere::fl::ppu {
 namespace {
@@ -278,6 +279,11 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             for (int64_t q = 0; q < nq; ++q) if (offsets[q] > offsets[q + 1]) return -1;
             if (offsets[nq] && !candidates) return -1;
         }
+        const bool profile = std::getenv("KNOWHERE_FL_PPU_PROFILE") != nullptr;
+        using Clock = std::chrono::steady_clock;
+        const auto runtime_started = profile ? Clock::now() : Clock::time_point{};
+        double candidate_h2d_ms = 0, d2h_ms = 0, launch_wait_ms = 0;
+        int64_t batch_calls = 0;
         auto bundle = Load(dim, k, metric, codes ? m : 0, codes ? ksub : 0);
         // Batch query and candidate tiles on the device. Each level is a
         // single grid launch; never serialize one launch per candidate chunk.
@@ -359,7 +365,10 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             starts[i] = total;
             total += (sizes[i] + 255) & ~size_t(255);
         }
+        const auto alloc_started = profile ? Clock::now() : Clock::time_point{};
         Buffer workspace(total, stream);
+        const double workspace_alloc_ms =
+            profile ? std::chrono::duration<double, std::milli>(Clock::now() - alloc_started).count() : 0;
         struct Slice { HGdeviceptr ptr; };
         Slice candidate_buffer{workspace.ptr + starts[0]}, offset_buffer{workspace.ptr + starts[1]};
         Slice lookup{workspace.ptr + starts[2]}, scores{workspace.ptr + starts[3]};
@@ -385,7 +394,6 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
                                                  static_cast<unsigned>((nb + 31) / 32));
             search_vectors = packed->ptr;
         }
-        const bool profile = std::getenv("KNOWHERE_FL_PPU_PROFILE") != nullptr;
         struct Events {
             HGevent begin = nullptr, scored = nullptr, selected = nullptr;
             explicit Events(bool enabled) {
@@ -416,12 +424,17 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
                     std::fill_n(distances + q * k, query_count * k, metric == 0 ? INFINITY : -INFINITY);
                     continue;
                 }
+                const auto copy_started = profile ? Clock::now() : Clock::time_point{};
                 const int64_t first = offsets[q], count = offsets[q + query_count] - first;
                 for (unsigned i = 0; i <= query_count; ++i) batch_offsets[i] = offsets[q + i] - first;
                 if (count)
                     Check(hgMemcpyHtoD(candidate_buffer.ptr, candidates + first, count * sizeof(int64_t)));
                 Check(hgMemcpyHtoD(offset_buffer.ptr, batch_offsets.data(), (query_count + 1) * sizeof(int64_t)));
+                if (profile)
+                    candidate_h2d_ms += std::chrono::duration<double, std::milli>(Clock::now() - copy_started).count();
             }
+            ++batch_calls;
+            const auto launch_started = profile ? Clock::now() : Clock::time_point{};
             if (profile)
                 Check(hgEventRecord(events.begin, stream));
             scored_slots += static_cast<uint64_t>(query_count) * width;
@@ -484,18 +497,26 @@ int Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, 
             if (profile) Check(hgEventRecord(events.selected, stream));
             Check(hgStreamSynchronize(stream));
             if (profile) {
+                launch_wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - launch_started).count();
                 float elapsed = 0;
                 Check(hgEventElapsedTime(&elapsed, events.begin, events.scored)); score_ms += elapsed;
                 Check(hgEventElapsedTime(&elapsed, events.scored, events.selected)); select_ms += elapsed;
             }
+            const auto d2h_started = profile ? Clock::now() : Clock::time_point{};
             Check(hgMemcpyDtoH(distances + q * k, out_score, query_count * k * sizeof(float)));
             Check(hgMemcpyDtoH(ids + q * k, out_ids, query_count * k * sizeof(int64_t)));
+            if (profile)
+                d2h_ms += std::chrono::duration<double, std::milli>(Clock::now() - d2h_started).count();
         }
         if (profile)
-            std::cerr << "PPU_PROFILE score_ms=" << score_ms << " select_ms=" << select_ms << " query_batch=" << batch
+            std::osyncstream(std::cerr) << "PPU_PROFILE score_ms=" << score_ms << " select_ms=" << select_ms << " query_batch=" << batch
                       << " candidate_count=" << (ivf ? offsets[nq] : 0) << " candidate_width=" << width
                       << " workspace_bytes=" << total << " candidate_device_bytes=" << (ivf ? sizes[0] + sizes[1] : 0)
-                      << " scored_slots=" << scored_slots << '\n';
+                      << " scored_slots=" << scored_slots << " base_ptr=" << Ptr(xb)
+                      << " candidate_h2d_ms=" << candidate_h2d_ms << " d2h_ms=" << d2h_ms
+                      << " workspace_alloc_ms=" << workspace_alloc_ms << " launch_wait_ms=" << launch_wait_ms
+                      << " batch_calls=" << batch_calls << " runtime_ms="
+                      << std::chrono::duration<double, std::milli>(Clock::now() - runtime_started).count() << '\n';
         return 0;
     } catch (const std::exception& e) {
         // Never free workspace while a failed launch chain may still use it.

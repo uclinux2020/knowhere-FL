@@ -351,6 +351,15 @@ TEST_CASE("FL_IVF_FLAT large CSR copy preserves candidate order across thread li
             }
         }
     }
+    // A failed device scan must read the same fully initialized CSR on CPU.
+    capture_ops.ivf_flat_scan = [](const void*, int64_t, int64_t, const void*, int64_t, const int64_t*, const int64_t*,
+                                   int64_t, int, float*, int64_t*, void*) { return -1; };
+    const auto fallback = index.Search(query, {{"metric_type", "L2"}, {"k", 1}, {"nprobe", 6}}, nullptr);
+    REQUIRE(fallback.has_value());
+    for (int64_t q = 0; q < nq; ++q) {
+        REQUIRE(fallback.value()->GetIds()[q] == 0);
+        REQUIRE(fallback.value()->GetDistance()[q] == 0.f);
+    }
 }
 
 TEST_CASE("FL_IVF_FLAT tied probes remain nested and full probes are exact", "[fl][ivf-nprobe]") {

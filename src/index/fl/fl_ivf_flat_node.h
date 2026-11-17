@@ -144,15 +144,16 @@ class FlIvfFlatIndexNode : public IndexNode {
         double route_ms = 0, materialize_ms = 0, query_stage_ms = 0, scan_ms = 0;
         // 1) centroid routing on host: per query pick nprobe nearest lists
         std::vector<int64_t> cand_ids;
+        std::unique_ptr<int64_t[]> unfiltered_ids;
         std::vector<int64_t> cand_offsets(static_cast<size_t>(nq) + 1, 0);
         // Full unfiltered probing is exact brute-force. Reuse the resident
         // base and implicit IDs instead of building nq copies of all row IDs.
         const auto* device_ops = dev_ready_ ? fl::GetDeviceOps() : nullptr;
-        const bool full_scan = bitset.empty() && nprobe == nlist_ && device_ops != nullptr &&
-                               device_ops->brute_force_topk != nullptr;
+        const bool full_scan =
+            bitset.empty() && nprobe == nlist_ && device_ops != nullptr && device_ops->brute_force_topk != nullptr;
         if (!full_scan) {
             BuildCandidateLists(xq, nq, nprobe, bitset, cand_ids, cand_offsets, profile ? &route_ms : nullptr,
-                                profile ? &materialize_ms : nullptr);
+                                profile ? &materialize_ms : nullptr, unfiltered_ids);
         }
 
         // 2) scan candidates: device path first, CPU fallback (design D5)
@@ -179,11 +180,12 @@ class FlIvfFlatIndexNode : public IndexNode {
                 if (staged) {
                     const auto scan_started = profile ? Clock::now() : Clock::time_point{};
                     if (full_scan) {
-                        done = ops->brute_force_topk(dev_xb_.get(), nb_, d_q, nq, dim_, k, metric_code_,
-                                                     distances, ids, nullptr) == 0;
+                        done = ops->brute_force_topk(dev_xb_.get(), nb_, d_q, nq, dim_, k, metric_code_, distances, ids,
+                                                     nullptr) == 0;
                     } else {
-                        done = ops->ivf_flat_scan(dev_xb_.get(), nb_, dim_, d_q, nq, cand_ids.data(), cand_offsets.data(),
-                                                  k, metric_code_, distances, ids, nullptr) == 0;
+                        const auto* candidate_data = unfiltered_ids ? unfiltered_ids.get() : cand_ids.data();
+                        done = ops->ivf_flat_scan(dev_xb_.get(), nb_, dim_, d_q, nq, candidate_data,
+                                                  cand_offsets.data(), k, metric_code_, distances, ids, nullptr) == 0;
                     }
                     if (profile)
                         scan_ms = std::chrono::duration<double, std::milli>(Clock::now() - scan_started).count();
@@ -200,10 +202,11 @@ class FlIvfFlatIndexNode : public IndexNode {
             // Missing specializations or device failures preserve the original
             // exact CPU fallback, including padding and filter semantics.
             if (full_scan) {
-                BuildCandidateLists(xq, nq, nprobe, bitset, cand_ids, cand_offsets,
-                                    profile ? &route_ms : nullptr, profile ? &materialize_ms : nullptr);
+                BuildCandidateLists(xq, nq, nprobe, bitset, cand_ids, cand_offsets, profile ? &route_ms : nullptr,
+                                    profile ? &materialize_ms : nullptr, unfiltered_ids);
             }
-            CpuScanCandidates(xq, nq, k, cand_ids, cand_offsets, distances, ids);
+            CpuScanCandidates(xq, nq, k, unfiltered_ids ? unfiltered_ids.get() : cand_ids.data(), cand_offsets,
+                              distances, ids);
         }
         if (profile) {
             int64_t minimum = nb_, maximum = 0;
@@ -213,16 +216,17 @@ class FlIvfFlatIndexNode : public IndexNode {
                 maximum = std::max(maximum, count);
             }
             LOG_KNOWHERE_INFO_ << "FL_IVF_SCAN nb=" << nb_ << " nq=" << nq << " nlist=" << nlist_
-                               << " nprobe=" << nprobe << " k=" << k << " candidates=" << cand_ids.size()
+                               << " nprobe=" << nprobe << " k=" << k << " candidates=" << cand_offsets[nq]
                                << " candidate_min=" << minimum << " candidate_max=" << maximum
-                               << " device=" << device_id_ << " device_done=" << done
-                               << " full_scan=" << full_scan
+                               << " device=" << device_id_ << " device_done=" << done << " full_scan=" << full_scan
                                << " node=" << reinterpret_cast<uintptr_t>(this)
-                               << " base_ptr=" << reinterpret_cast<uintptr_t>(dev_xb_.get())
-                               << " start_us=" << epoch_us
+                               << " base_ptr=" << reinterpret_cast<uintptr_t>(dev_xb_.get()) << " start_us=" << epoch_us
                                << " route_ms=" << route_ms << " materialize_ms=" << materialize_ms
                                << " query_stage_ms=" << query_stage_ms << " scan_ms=" << scan_ms
-                               << " host_capacity_bytes=" << cand_ids.capacity() * sizeof(int64_t) << " elapsed_ms="
+                               << " host_capacity_bytes="
+                               << (unfiltered_ids ? static_cast<size_t>(cand_offsets[nq]) : cand_ids.capacity()) *
+                                      sizeof(int64_t)
+                               << " elapsed_ms="
                                << std::chrono::duration<double, std::milli>(Clock::now() - started).count();
         }
         // bitset already applied up-front in BuildCandidateLists (both device
@@ -617,12 +621,12 @@ class FlIvfFlatIndexNode : public IndexNode {
 
     void
     BuildCandidateLists(const float* xq, int64_t nq, int64_t nprobe, const BitsetView& bitset,
-                        std::vector<int64_t>& cand_ids, std::vector<int64_t>& cand_offsets, double* route_ms = nullptr,
-                        double* materialize_ms = nullptr) const {
+                        std::vector<int64_t>& cand_ids, std::vector<int64_t>& cand_offsets, double* route_ms,
+                        double* materialize_ms, std::unique_ptr<int64_t[]>& unfiltered_ids) const {
         using Clock = std::chrono::steady_clock;
         const auto started = route_ms ? Clock::now() : Clock::time_point{};
         std::vector<std::vector<int64_t>> probes(nq);
-#pragma omp parallel for schedule(static) if(nq > 1 && nlist_ > 8388608 / dim_ / nq)
+#pragma omp parallel for schedule(static) if (nq > 1 && nlist_ > 8388608 / dim_ / nq)
         for (int64_t i = 0; i < nq; ++i) {
             std::vector<std::pair<float, int64_t>> scores(nlist_);
             const float* q = xq + i * dim_;
@@ -663,7 +667,10 @@ class FlIvfFlatIndexNode : public IndexNode {
                 }
                 cand_offsets[i + 1] = cand_offsets[i] + count;
             }
-            cand_ids.resize(static_cast<size_t>(cand_offsets[nq]));
+            // Every element is overwritten below before either scanner reads it.
+            // Default-initialized scalar storage avoids an extra serial zero-fill.
+            unfiltered_ids.reset(new int64_t[static_cast<size_t>(cand_offsets[nq])]);
+            auto* output = unfiltered_ids.get();
             // CSR copying is bandwidth-bound. A full machine-wide OpenMP team
             // adds scheduling cost and contention without more useful bandwidth.
             const int copy_threads = static_cast<int>(std::min<int64_t>({nq, omp_get_max_threads(), 8}));
@@ -672,7 +679,8 @@ class FlIvfFlatIndexNode : public IndexNode {
                 auto position = cand_offsets[i];
                 for (const int64_t l : probes[i]) {
                     const auto& list = invlists_[l];
-                    if (!list.empty()) std::copy(list.begin(), list.end(), cand_ids.data() + position);
+                    if (!list.empty())
+                        std::copy(list.begin(), list.end(), output + position);
                     position += static_cast<int64_t>(list.size());
                 }
             }
@@ -685,7 +693,8 @@ class FlIvfFlatIndexNode : public IndexNode {
             for (const int64_t l : probes[i]) {
                 const auto& list = invlists_[l];
                 for (const int64_t id : list) {
-                    if (!bitset.test(id)) cand_ids.push_back(id);
+                    if (!bitset.test(id))
+                        cand_ids.push_back(id);
                 }
             }
         }
@@ -695,7 +704,7 @@ class FlIvfFlatIndexNode : public IndexNode {
     }
 
     void
-    CpuScanCandidates(const float* xq, int64_t nq, int64_t k, const std::vector<int64_t>& cand_ids,
+    CpuScanCandidates(const float* xq, int64_t nq, int64_t k, const int64_t* cand_ids,
                       const std::vector<int64_t>& cand_offsets, float* distances, int64_t* ids) const {
         const bool is_ip = metric_code_ == 1;
 #pragma omp parallel for schedule(dynamic)

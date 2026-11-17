@@ -27,12 +27,12 @@ Scan(const void*, int64_t, int64_t, const void*, int64_t nq, const int64_t*, con
 
 int
 main(int argc, char** argv) {
-    if (argc != 4)
-        throw std::runtime_error("Args: nb nprobe repeats");
+    if (argc != 4 && argc != 5)
+        throw std::runtime_error("Args: nb nprobe repeats [nlist]");
     const int64_t nb = std::stoll(argv[1]), nprobe = std::stoll(argv[2]);
     const int repeats = std::stoi(argv[3]);
-    const int64_t dim = 128, nlist = 128, nq = 100, metric = 0;
-    if (nb < nlist || nprobe <= 0 || nprobe >= nlist || repeats < 3)
+    const int64_t dim = 128, nlist = argc == 5 ? std::stoll(argv[4]) : 128, nq = 100, metric = 0;
+    if (nlist <= 0 || nb < nlist || nprobe <= 0 || nprobe >= nlist || repeats < 3)
         throw std::runtime_error("Invalid benchmark shape");
     knowhere::fl::GetDeviceOps();  // Consume lazy native registration before installing the host adapter.
     knowhere::fl::RegisterDeviceOps(nullptr);

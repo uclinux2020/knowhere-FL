@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -25,7 +26,6 @@
 #include <utility>
 #include <vector>
 
-#include "knowhere/index/index_static.h"
 #include "common/fl/fl_device.h"
 #include "common/fl/fl_device_router.h"
 #include "index/fl/fl_format.h"
@@ -37,6 +37,7 @@
 #include "knowhere/dataset.h"
 #include "knowhere/expected.h"
 #include "knowhere/index/index_node.h"
+#include "knowhere/index/index_static.h"
 #include "knowhere/log.h"
 #include "knowhere/utils.h"
 
@@ -165,6 +166,18 @@ class FlIvfFlatIndexNode : public IndexNode {
         }
         if (!done) {
             CpuScanCandidates(xq, nq, k, cand_ids, cand_offsets, distances, ids);
+        }
+        if (std::getenv("KNOWHERE_FL_PPU_PROFILE") != nullptr) {
+            int64_t minimum = nb_, maximum = 0;
+            for (int64_t q = 0; q < nq; ++q) {
+                const int64_t count = cand_offsets[q + 1] - cand_offsets[q];
+                minimum = std::min(minimum, count);
+                maximum = std::max(maximum, count);
+            }
+            LOG_KNOWHERE_INFO_ << "FL_IVF_SCAN nb=" << nb_ << " nq=" << nq << " nlist=" << nlist_
+                               << " nprobe=" << nprobe << " k=" << k << " candidates=" << cand_ids.size()
+                               << " candidate_min=" << minimum << " candidate_max=" << maximum
+                               << " device=" << device_id_ << " device_done=" << done;
         }
         // bitset already applied up-front in BuildCandidateLists (both device
         // and CPU scans receive pre-filtered candidates); no post-filter here.

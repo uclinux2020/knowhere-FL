@@ -94,16 +94,18 @@ CreateFlIndex(const std::string& name) {
 }  // namespace
 
 TEST_CASE("FL host adapter registration", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::GetDeviceOps();              // Complete native lazy registration before the test override.
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     REQUIRE(knowhere::fl::RegisterHostAdapter());
     REQUIRE(knowhere::fl::DeviceAvailable());
     REQUIRE(knowhere::fl::DeviceCount() == 1);
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     REQUIRE_FALSE(knowhere::fl::DeviceAvailable());
 }
 
 TEST_CASE("FL_BRUTE_FORCE build/search matches exact KNN (CPU fallback)", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();  // no adapter -> CPU fallback path
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.  // no
+                                               // adapter -> CPU fallback path
     auto base = GenDataSet(kNb, kDim, 42);
     auto query = GenDataSet(kNq, kDim, 7);
     auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_BRUTEFORCE);
@@ -123,7 +125,8 @@ TEST_CASE("FL_BRUTE_FORCE build/search matches exact KNN (CPU fallback)", "[fl]"
 }
 
 TEST_CASE("FL_BRUTE_FORCE device path via host adapter matches exact KNN", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::GetDeviceOps();              // Complete native lazy registration before the test override.
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     REQUIRE(knowhere::fl::RegisterHostAdapter());
     knowhere::fl::FlMemoryPool::Instance().Configure(0, 0);  // unlimited
 
@@ -141,11 +144,12 @@ TEST_CASE("FL_BRUTE_FORCE device path via host adapter matches exact KNN", "[fl]
     auto truth = ExactKnn(static_cast<const float*>(base->GetTensor()), static_cast<const float*>(query->GetTensor()),
                           kNb, kNq, kDim, kK, /*is_ip=*/true);
     REQUIRE(RecallAtK(res.value(), truth, kNq, kK) == 1.0f);
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
 }
 
 TEST_CASE("FL_BRUTE_FORCE OOM pre-check falls back to CPU with correct results", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::GetDeviceOps();              // Complete native lazy registration before the test override.
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     REQUIRE(knowhere::fl::RegisterHostAdapter());
     knowhere::fl::FlMemoryPool::Instance().Configure(0, 1);  // 1-byte ceiling -> staging rejected (D5)
 
@@ -165,11 +169,11 @@ TEST_CASE("FL_BRUTE_FORCE OOM pre-check falls back to CPU with correct results",
     REQUIRE(RecallAtK(res.value(), truth, kNq, kK) == 1.0f);
 
     knowhere::fl::FlMemoryPool::Instance().Configure(0, 0);
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
 }
 
 TEST_CASE("FL_BRUTE_FORCE serialize/deserialize round trip", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     auto base = GenDataSet(kNb, kDim, 42);
     auto query = GenDataSet(kNq, kDim, 7);
 
@@ -201,7 +205,8 @@ TEST_CASE("FL_BRUTE_FORCE rejects COSINE with guidance (design D4)", "[fl]") {
 }
 
 TEST_CASE("FL_IVF_FLAT build/search recall on clustered data", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::GetDeviceOps();              // Complete native lazy registration before the test override.
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     REQUIRE(knowhere::fl::RegisterHostAdapter());
     knowhere::fl::FlMemoryPool::Instance().Configure(0, 0);
 
@@ -227,7 +232,7 @@ TEST_CASE("FL_IVF_FLAT build/search recall on clustered data", "[fl]") {
     REQUIRE(res2.has_value());
     REQUIRE(RecallAtK(res2.value(), truth, kNq, kK) >= 0.8f);
 
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
 }
 
 TEST_CASE("FL_IVF_FLAT tied probes remain nested and full probes are exact", "[fl][ivf-nprobe]") {
@@ -333,7 +338,7 @@ TEST_CASE("FL_IVF_FLAT tied probes remain nested and full probes are exact", "[f
 }
 
 TEST_CASE("FL_IVF_FLAT serialize/deserialize round trip", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     auto base = GenDataSet(kNb, kDim, 42);
     auto query = GenDataSet(kNq, kDim, 7);
 
@@ -361,7 +366,8 @@ TEST_CASE("FL_IVF_FLAT device-assign and CPU routing agree", "[fl]") {
     // With the host adapter registered, kmeans assignment routes through the
     // emulated device (ops->kmeans_assign). use_device_assign=false must give
     // identical recall via pure CPU routing (design D5 fallback parity).
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::GetDeviceOps();              // Complete native lazy registration before the test override.
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     REQUIRE(knowhere::fl::RegisterHostAdapter());
     knowhere::fl::FlMemoryPool::Instance().Configure(0, 0);
 
@@ -390,7 +396,7 @@ TEST_CASE("FL_IVF_FLAT device-assign and CPU routing agree", "[fl]") {
     REQUIRE(RecallAtK(res_cpu.value(), truth, kNq, kK) == 1.0f);
 
     knowhere::fl::FlMemoryPool::Instance().Configure(0, 0);
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
 }
 
 TEST_CASE("FL_IVF_PQ device ADC and CPU fallback agree", "[fl]") {
@@ -398,7 +404,8 @@ TEST_CASE("FL_IVF_PQ device ADC and CPU fallback agree", "[fl]") {
     // device and scans via ops->ivf_pq_scan. A second index built with a
     // 1-byte pool cap fails the OOM pre-check (D5) and scans on CPU. Both
     // must return identical top-k ids (deterministic ADC semantics).
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::GetDeviceOps();              // Complete native lazy registration before the test override.
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     REQUIRE(knowhere::fl::RegisterHostAdapter());
 
     auto base = GenDataSet(kNb, kDim, 42);
@@ -431,11 +438,11 @@ TEST_CASE("FL_IVF_PQ device ADC and CPU fallback agree", "[fl]") {
                           kNb, kNq, kDim, kK, /*is_ip=*/false);
     REQUIRE(RecallAtK(res_dev.value(), truth, kNq, kK) >= 0.4f);
 
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
 }
 
 TEST_CASE("FL_IVF_PQ serialize/deserialize round trip", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     auto base = GenDataSet(kNb, kDim, 42);
     auto query = GenDataSet(kNq, kDim, 7);
 
@@ -490,18 +497,18 @@ TEST_CASE("FL_IVF_PQ rejects invalid train params", "[fl]") {
 TEST_CASE("FL device router round-robin", "[fl]") {
     auto& router = knowhere::fl::FlDeviceRouter::Instance();
     router.Reset();
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     // no adapter -> single-device semantics
     REQUIRE(router.Acquire() == 0);
     // host adapter reports exactly 1 emulated device -> always 0
     REQUIRE(knowhere::fl::RegisterHostAdapter());
     REQUIRE(router.Acquire() == 0);
     REQUIRE(router.Acquire() == 0);
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
 }
 
 TEST_CASE("FL_BRUTE_FORCE GetVectorByIds returns raw vectors", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     auto base = GenDataSet(kNb, kDim, 42);
     auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_BRUTEFORCE);
     knowhere::Json build = knowhere::Json::parse(R"({"metric_type":"L2","dim":16})");
@@ -523,7 +530,7 @@ TEST_CASE("FL_BRUTE_FORCE GetVectorByIds returns raw vectors", "[fl]") {
 }
 
 TEST_CASE("FL_IVF_PQ reports no raw data", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     auto base = GenDataSet(kNb, kDim, 42);
     auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFPQ);
     knowhere::Json build = knowhere::Json::parse(R"({"metric_type":"L2","dim":16,"nlist":16,"m":4,"nbits":8})");
@@ -538,7 +545,7 @@ TEST_CASE("FL_IVF_PQ reports no raw data", "[fl]") {
 }
 
 TEST_CASE("FL deserialize rejects corrupted format header", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     auto base = GenDataSet(kNb, kDim, 42);
     auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_BRUTEFORCE);
     knowhere::Json build = knowhere::Json::parse(R"({"metric_type":"L2","dim":16})");
@@ -606,7 +613,8 @@ TEST_CASE("FL nodes expose static load-resource estimates", "[fl]") {
 }
 
 TEST_CASE("FL_CAGRA graph search reaches high recall with wide frontier", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();  // CPU traversal path
+    knowhere::fl::RegisterDeviceOps(
+        nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.  // CPU traversal path
     auto base = GenDataSet(kNb, kDim, 42);
     auto query = GenDataSet(kNq, kDim, 7);
 
@@ -626,7 +634,7 @@ TEST_CASE("FL_CAGRA graph search reaches high recall with wide frontier", "[fl]"
 }
 
 TEST_CASE("FL_CAGRA serialize/deserialize round trip preserves results", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     auto base = GenDataSet(kNb, kDim, 42);
     auto query = GenDataSet(kNq, kDim, 7);
 
@@ -657,7 +665,7 @@ TEST_CASE("FL_CAGRA serialize/deserialize round trip preserves results", "[fl]")
 }
 
 TEST_CASE("FL_CAGRA refuses oversized CPU graph build", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     // v1 CPU builder is quadratic and refused beyond kMaxCpuGraphRows; the
     // rejection happens before any O(nb^2) work, so a tiny dim keeps this fast
     auto huge = GenDataSet(knowhere::FlCagraIndexNode<knowhere::fp32>::kMaxCpuGraphRows + 1, 2, 1);
@@ -667,7 +675,7 @@ TEST_CASE("FL_CAGRA refuses oversized CPU graph build", "[fl]") {
 }
 
 TEST_CASE("FL_CAGRA post-filters bitset from traversal results", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     auto base = GenDataSet(kNb, kDim, 42);
     auto query = GenDataSet(1, kDim, 7);
 
@@ -680,8 +688,8 @@ TEST_CASE("FL_CAGRA post-filters bitset from traversal results", "[fl]") {
     REQUIRE(unfiltered.has_value());
     const int64_t banned = unfiltered.value()->GetIds()[0];
 
-    std::vector<uint8_t> bits(kNb, 0);
-    bits[static_cast<size_t>(banned)] = 1;
+    std::vector<uint8_t> bits((kNb + 7) / 8, 0);
+    bits[static_cast<size_t>(banned) / 8] |= static_cast<uint8_t>(1u << (banned % 8));
     auto filtered = idx.Search(query, search, knowhere::BitsetView(bits.data(), kNb));
     REQUIRE(filtered.has_value());
     const auto* fids = filtered.value()->GetIds();
@@ -691,7 +699,7 @@ TEST_CASE("FL_CAGRA post-filters bitset from traversal results", "[fl]") {
 }
 
 TEST_CASE("FL_CAGRA GetVectorByIds returns raw vectors", "[fl]") {
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
     auto base = GenDataSet(kNb, kDim, 42);
     auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_CAGRA);
     knowhere::Json build = knowhere::Json::parse(R"({"metric_type":"L2","dim":16,"graph_degree":16})");
@@ -725,8 +733,8 @@ TEST_CASE("FL_BRUTE_FORCE bitset over-fetch keeps exact top-k", "[fl]") {
     REQUIRE(unfiltered.has_value());
     const int64_t banned = unfiltered.value()->GetIds()[0];
 
-    std::vector<uint8_t> bits(kNb, 0);
-    bits[static_cast<size_t>(banned)] = 1;
+    std::vector<uint8_t> bits((kNb + 7) / 8, 0);
+    bits[static_cast<size_t>(banned) / 8] |= static_cast<uint8_t>(1u << (banned % 8));
     auto filtered = idx.Search(query, search, knowhere::BitsetView(bits.data(), kNb));
     REQUIRE(filtered.has_value());
     const auto* fids = filtered.value()->GetIds();
@@ -739,7 +747,7 @@ TEST_CASE("FL_BRUTE_FORCE bitset over-fetch keeps exact top-k", "[fl]") {
             REQUIRE(fids[t] == unfiltered.value()->GetIds()[t + 1]);
         }
     }
-    knowhere::fl::UnregisterHostAdapter();
+    knowhere::fl::RegisterDeviceOps(nullptr);  // Explicitly isolate host/CPU tests from native PPU registration.
 }
 
 #endif  // KNOWHERE_WITH_FL

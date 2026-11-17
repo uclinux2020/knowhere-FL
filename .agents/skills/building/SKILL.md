@@ -77,6 +77,7 @@ Knowhere library or replace the Catch2 FL tests.
 
 ## Common Issues
 
+- **Folly F14 link mismatch**: `F14LinkCheck<...Mode)1/2>` means inconsistent SIMD/CRC ABI between Folly, Knowhere, or prebuilt milvus-common. Rebuild actual dependencies with matching ISA flags; never add a fake symbol or disable the check. A cached Folly binary may predate the recipe's SSE4.2 fix. See [the isolated rebuild and Milvus sweep record](../../../docs/ppu-milvus-sweep-20261117.md) for the verified environment-specific procedure.
 - **libstdc++ errors**: Override with `make LIBCXX=libstdc++11`
 - **macOS**: `libc++` is auto-detected; OpenMP uses Homebrew's libomp
 - **CMake 4.x**: Makefile already exports `CMAKE_POLICY_VERSION_MINIMUM=3.5` for old dependency recipes

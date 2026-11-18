@@ -304,15 +304,37 @@ TEST_CASE("FL_IVF_FLAT large CSR copy preserves candidate order across thread li
     };
     // The adapter outlives all buffers owned by the node.
     knowhere::fl::RegisterDeviceOps(&capture_ops);
-    constexpr int64_t nb = 16384, nq = 100, nlist = 64;
-    // Exercise serial and parallel routing as well as the CSR copy threshold.
-    const int64_t dim = GENERATE(1, 128);
+    constexpr int64_t nq = 100;
+    const int64_t nlist = GENERATE(64, 65);
+    const int64_t nb = nlist * 256;
+    // Include a partial SIMD block and a dimension not divisible by the lane count.
+    const int64_t dim = GENERATE(1, 17, 128);
     const int32_t metric = GENERATE(0, 1);
     const std::string metric_name = metric == 0 ? "L2" : "IP";
     std::vector<float> centroids(nlist * dim, 0.f), xb(nb * dim), queries(nq * dim, 0.f);
-    for (int64_t list = 0; list < nlist; ++list) centroids[list * dim] = static_cast<float>(metric == 0 ? list : -list);
-    if (metric == 1)
-        for (int64_t q = 0; q < nq; ++q) queries[q * dim] = 1.f;
+    // Permuted, tied scores exercise both selection algorithms and their boundary.
+    for (int64_t list = 0; list < nlist; ++list) {
+        const float value = static_cast<float>((list * 17 % nlist) / 3);
+        centroids[list * dim] = metric == 0 ? value : -value;
+        for (int64_t d = 1; d < dim; ++d) centroids[list * dim + d] = static_cast<float>((list + d) % 7 - 3) * 0.125f;
+    }
+    for (int64_t q = 0; q < nq; ++q) {
+        queries[q * dim] = metric == 1 ? 1.f : 0.f;
+        for (int64_t d = 1; d < dim; ++d) queries[q * dim + d] = 0.125f;
+    }
+    std::vector<std::pair<float, int64_t>> route_order;
+    for (int64_t list = 0; list < nlist; ++list) {
+        float norm = 0.f, dot = 0.f;
+        for (int64_t d = 0; d < dim; ++d) {
+            const float c = centroids[list * dim + d];
+            norm += c * c;
+            dot += queries[d] * c;
+        }
+        route_order.emplace_back(metric == 0 ? norm - 2.f * dot : dot, list);
+    }
+    std::sort(route_order.begin(), route_order.end(), [metric](const auto& a, const auto& b) {
+        return a.first == b.first ? a.second < b.second : metric == 1 ? a.first > b.first : a.first < b.first;
+    });
     knowhere::MemoryIOWriter writer;
     knowhere::fl::WriteFormatHeader(writer);
     writer(&dim, sizeof(dim), 1);
@@ -332,8 +354,8 @@ TEST_CASE("FL_IVF_FLAT large CSR copy preserves candidate order across thread li
     REQUIRE(index.Deserialize(binary, {{"metric_type", metric_name}, {"dim", dim}, {"nlist", nlist}}) ==
             knowhere::Status::success);
     auto query = knowhere::GenDataSet(nq, dim, queries.data());
-    // Probe 40 is below the parallel copy threshold; probe 42 is above it.
-    for (int64_t probe : {40, 42}) {
+    // Cover small/large probe prefixes; 40/42 straddle parallel copying.
+    for (int64_t probe : {1, 8, 9, 40, 42, 63}) {
         const knowhere::Json config = {{"metric_type", metric_name}, {"k", 1}, {"nprobe", probe}};
         omp_set_num_threads(1);
         REQUIRE(index.Search(query, config, nullptr).has_value());
@@ -350,7 +372,7 @@ TEST_CASE("FL_IVF_FLAT large CSR copy preserves candidate order across thread li
             const auto first = serial_offsets[q];
             for (int64_t list = 0; list < probe; ++list) {
                 for (int64_t row = 0; row < nb / nlist; ++row) {
-                    if (serial_ids[first + list * (nb / nlist) + row] != row * nlist + list) {
+                    if (serial_ids[first + list * (nb / nlist) + row] != row * nlist + route_order[list].second) {
                         FAIL("CSR member order changed");
                     }
                 }
@@ -378,9 +400,13 @@ TEST_CASE("FL_IVF_FLAT large CSR copy preserves candidate order across thread li
                                    int64_t, int, float*, int64_t*, void*) { return -1; };
     const auto fallback = index.Search(query, {{"metric_type", metric_name}, {"k", 1}, {"nprobe", 6}}, nullptr);
     REQUIRE(fallback.has_value());
+    int64_t best_id = nb;
+    for (int64_t p = 0; p < 6; ++p) best_id = std::min(best_id, route_order[p].second);
+    float query_norm = 0.f;
+    for (int64_t d = 0; d < dim; ++d) query_norm += queries[d] * queries[d];
     for (int64_t q = 0; q < nq; ++q) {
-        REQUIRE(fallback.value()->GetIds()[q] == 0);
-        REQUIRE(fallback.value()->GetDistance()[q] == 0.f);
+        REQUIRE(fallback.value()->GetIds()[q] == best_id);
+        REQUIRE(fallback.value()->GetDistance()[q] == (metric == 0 ? query_norm : 0.f));
     }
 }
 

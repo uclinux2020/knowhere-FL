@@ -19,9 +19,32 @@ const knowhere::fl::FlDeviceOps* host_ops;
 bool native_scan = false;
 int native_calls = 0;
 std::vector<int64_t> expected_ids;
+std::vector<int64_t> expected_probes;
+int64_t fixture_nlist = 0;
+bool csr_verified = false;
 int
 Scan(const void* xb, int64_t nb, int64_t dim, const void* queries, int64_t nq, const int64_t* candidates,
      const int64_t* offsets, int64_t k, int metric, float* scores, int64_t* ids, void* stream) {
+    // Validate the entire ordered CSR against independent scalar routing once,
+    // during the first untimed warmup, not merely against its own device result.
+    if (!csr_verified) {
+        const int64_t nprobe = expected_probes.size() / nq;
+        int64_t position = offsets[0];
+        for (int64_t q = 0; q < nq; ++q) {
+            if (offsets[q] != position)
+                throw std::runtime_error("CSR start differs from scalar oracle");
+            for (int64_t p = 0; p < nprobe; ++p) {
+                const int64_t list = expected_probes[q * nprobe + p];
+                for (int64_t id = list; id < nb; id += fixture_nlist) {
+                    if (position >= offsets[q + 1] || candidates[position++] != id)
+                        throw std::runtime_error("Ordered CSR differs from scalar centroid routing");
+                }
+            }
+            if (position != offsets[q + 1])
+                throw std::runtime_error("CSR end differs from scalar oracle");
+        }
+        csr_verified = true;
+    }
     if (native_scan) {
         const int status =
             host_ops->ivf_flat_scan(xb, nb, dim, queries, nq, candidates, offsets, k, metric, scores, ids, stream);
@@ -51,12 +74,13 @@ Scan(const void* xb, int64_t nb, int64_t dim, const void* queries, int64_t nq, c
 
 int
 main(int argc, char** argv) {
-    if (argc != 4 && argc != 5)
-        throw std::runtime_error("Args: nb nprobe repeats [nlist]");
+    if (argc < 4 || argc > 7)
+        throw std::runtime_error("Args: nb nprobe repeats [nlist [nq [dim]]]");
     const int64_t nb = std::stoll(argv[1]), nprobe = std::stoll(argv[2]);
     const int repeats = std::stoi(argv[3]);
-    const int64_t dim = 128, nlist = argc == 5 ? std::stoll(argv[4]) : 128, nq = 100, metric = 0;
-    if (nlist <= 0 || nb < nlist || nprobe <= 0 || nprobe >= nlist || repeats < 3)
+    const int64_t dim = argc >= 7 ? std::stoll(argv[6]) : 128, nlist = argc >= 5 ? std::stoll(argv[4]) : 128;
+    const int64_t nq = argc >= 6 ? std::stoll(argv[5]) : 100, metric = 0;
+    if (nlist <= 0 || nb < nlist || nq <= 0 || dim <= 0 || nprobe <= 0 || nprobe >= nlist || repeats < 3)
         throw std::runtime_error("Invalid benchmark shape");
     native_scan = std::getenv("KNOWHERE_IVF_BENCH_NATIVE") != nullptr;
     const auto* native_ops = knowhere::fl::GetDeviceOps();
@@ -78,6 +102,22 @@ main(int argc, char** argv) {
     std::vector<float> centroids(nlist * dim), xb(nb * dim), queries(nq * dim);
     for (auto& x : centroids) x = random(rng);
     for (auto& x : queries) x = random(rng);
+    fixture_nlist = nlist;
+    expected_probes.resize(nq * nprobe);
+    for (int64_t q = 0; q < nq; ++q) {
+        std::vector<std::pair<float, int64_t>> scores(nlist);
+        for (int64_t list = 0; list < nlist; ++list) {
+            float norm = 0.f, dot = 0.f;
+            for (int64_t d = 0; d < dim; ++d) {
+                const float c = centroids[list * dim + d];
+                norm += c * c;
+                dot += queries[q * dim + d] * c;
+            }
+            scores[list] = {norm - 2.f * dot, list};
+        }
+        std::sort(scores.begin(), scores.end());
+        for (int64_t p = 0; p < nprobe; ++p) expected_probes[q * nprobe + p] = scores[p].second;
+    }
     knowhere::MemoryIOWriter writer;
     knowhere::fl::WriteFormatHeader(writer);
     writer(&dim, sizeof(dim), 1);

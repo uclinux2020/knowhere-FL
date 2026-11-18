@@ -95,6 +95,7 @@ class FlIvfFlatIndexNode : public IndexNode {
             return Status::invalid_args;
         }
         TrainKmeans(x, nb);
+        RefreshRoutingCentroids();
         return Status::success;
     }
 
@@ -364,6 +365,7 @@ class FlIvfFlatIndexNode : public IndexNode {
             }
         }
         RefreshCentroidNorms();
+        RefreshRoutingCentroids();
         TryStageToDevice();
         return Status::success;
     }
@@ -407,7 +409,7 @@ class FlIvfFlatIndexNode : public IndexNode {
 
     int64_t
     Size() const override {
-        return nb_ * dim_ * sizeof(float) + nlist_ * dim_ * sizeof(float);
+        return nb_ * dim_ * sizeof(float) + nlist_ * dim_ * sizeof(float) + routing_centroids_.size() * sizeof(float);
     }
 
     int64_t
@@ -616,6 +618,54 @@ class FlIvfFlatIndexNode : public IndexNode {
         }
     }
 
+    // Cache dimension-major centroid blocks for SIMD across independent dots.
+    // The dimension loop stays ordered, preserving each scalar accumulation.
+    // This derived cache is rebuilt after Train/Deserialize, never serialized.
+    static constexpr int64_t kRoutingBlock = 16;
+    void
+    RefreshRoutingCentroids() {
+        routing_centroids_.clear();
+        if (nlist_ < kRoutingBlock || dim_ < 16)
+            return;
+        const int64_t blocks = (nlist_ + kRoutingBlock - 1) / kRoutingBlock;
+        routing_centroids_.resize(static_cast<size_t>(blocks) * dim_ * kRoutingBlock, 0.f);
+        for (int64_t l = 0; l < nlist_; ++l) {
+            const auto block = l / kRoutingBlock;
+            const auto lane = l % kRoutingBlock;
+            for (int64_t d = 0; d < dim_; ++d)
+                routing_centroids_[(block * dim_ + d) * kRoutingBlock + lane] = centroids_[l * dim_ + d];
+        }
+    }
+
+    void
+    ScoreRoutingCentroids(const float* q, std::vector<std::pair<float, int64_t>>& scores) const {
+        if (routing_centroids_.empty()) {
+            for (int64_t l = 0; l < nlist_; ++l) {
+                const float* c = centroids_.data() + l * dim_;
+                float dot = 0.f;
+                for (int64_t d = 0; d < dim_; ++d) dot += q[d] * c[d];
+                scores[l] = {metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot), l};
+            }
+            return;
+        }
+        for (int64_t first = 0; first < nlist_; first += kRoutingBlock) {
+            float dots[kRoutingBlock] = {};
+            const auto* block = routing_centroids_.data() + first * dim_;
+            for (int64_t d = 0; d < dim_; ++d) {
+                const float value = q[d];
+                const auto* values = block + d * kRoutingBlock;
+#pragma omp simd
+                for (int64_t lane = 0; lane < kRoutingBlock; ++lane) dots[lane] += value * values[lane];
+            }
+            const int64_t lanes = std::min(kRoutingBlock, nlist_ - first);
+            for (int64_t lane = 0; lane < lanes; ++lane) {
+                const int64_t l = first + lane;
+                const float dot = dots[lane];
+                scores[l] = {metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot), l};
+            }
+        }
+    }
+
     void
     BuildCandidateLists(const float* xq, int64_t nq, int64_t nprobe, const BitsetView& bitset,
                         std::vector<int64_t>& cand_ids, std::vector<int64_t>& cand_offsets, double* route_ms,
@@ -638,20 +688,16 @@ class FlIvfFlatIndexNode : public IndexNode {
                 // Route score: IP uses the raw dot; L2 uses ||c||^2 - 2*q.c from
                 // the cached centroid norms (the query norm is a constant offset
                 // across centroids and does not affect probe selection).
-                for (int64_t l = 0; l < nlist_; ++l) {
-                    const float* c = centroids_.data() + l * dim_;
-                    float dot = 0.f;
-                    for (int64_t d = 0; d < dim_; ++d) {
-                        dot += q[d] * c[d];
-                    }
-                    scores[l] = {metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot), l};
-                }
+                ScoreRoutingCentroids(q, scores);
                 const bool is_ip = metric_code_ == 1;
-                std::partial_sort(
-                    scores.begin(), scores.begin() + nprobe, scores.end(), [is_ip](const auto& a, const auto& b) {
-                        // A total order keeps probe prefixes nested even when centroids tie.
-                        return a.first == b.first ? a.second < b.second : is_ip ? a.first > b.first : a.first < b.first;
-                    });
+                const auto compare = [is_ip](const auto& a, const auto& b) {
+                    // A total order keeps probe prefixes nested even when centroids tie.
+                    return a.first == b.first ? a.second < b.second : is_ip ? a.first > b.first : a.first < b.first;
+                };
+                const auto selected_end = scores.begin() + nprobe;
+                // Preserve heap selection: partition/sort did not improve all
+                // fixed-artifact RPC workloads in the routing ablation.
+                std::partial_sort(scores.begin(), selected_end, scores.end(), compare);
                 auto* pl = probes.data() + i * nprobe;
                 for (int64_t p = 0; p < nprobe; ++p) {
                     pl[p] = scores[p].second;
@@ -806,12 +852,13 @@ class FlIvfFlatIndexNode : public IndexNode {
     int64_t dim_{0};
     int64_t nb_{0};
     int64_t nlist_{0};
-    int metric_code_{0};             // 0 = L2, 1 = IP
-    bool use_device_assign_{true};   // device centroid routing (train/add)
-    std::vector<float> centroids_;   // nlist * dim
-    std::vector<float> cent_norms_;  // cached ||c_l||^2 (L2 routing; empty for IP)
-    std::vector<float> host_xb_;     // nb * dim
-    std::vector<int64_t> assign_;    // nb -> list id
+    int metric_code_{0};                    // 0 = L2, 1 = IP
+    bool use_device_assign_{true};          // device centroid routing (train/add)
+    std::vector<float> centroids_;          // nlist * dim
+    std::vector<float> cent_norms_;         // cached ||c_l||^2 (L2 routing; empty for IP)
+    std::vector<float> routing_centroids_;  // blocked dimension-major search cache
+    std::vector<float> host_xb_;            // nb * dim
+    std::vector<int64_t> assign_;           // nb -> list id
     std::vector<std::vector<int64_t>> invlists_;
     fl::FlDeviceBuffer dev_xb_;
     bool dev_ready_{false};

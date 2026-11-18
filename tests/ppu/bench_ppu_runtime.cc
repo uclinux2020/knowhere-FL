@@ -246,7 +246,17 @@ int main(int argc, char** argv) {
         auto first_start = Clock::now(); search(); double first_s = Seconds(first_start);
         search();
         std::vector<double> times;
-        for (int repeat = 0; repeat < iters; ++repeat) { auto start = Clock::now(); search(); times.push_back(Seconds(start)); }
+        for (int repeat = 0; repeat < iters; ++repeat) {
+            auto start = Clock::now();
+            search();
+            times.push_back(Seconds(start));
+            // Validate every timed result outside the measured request region.
+            if (mode != "assign") {
+                const auto check = Compare(truth, actual, nq, k);
+                Require(check.at("ordered_id_mismatches") == 0 && check.at("score_mismatches") == 0,
+                        "PPU timed-sample correctness check failed");
+            }
+        }
         if (mode == "assign") for (int64_t q = 0; q < nq; ++q) {
             Require(actual.ids[q] >= 0 && actual.ids[q] < nb, "invalid assigned centroid");
             actual.scores[q] = Distance(queries.data() + q * dim, xb.data() + actual.ids[q] * dim, dim, metric);

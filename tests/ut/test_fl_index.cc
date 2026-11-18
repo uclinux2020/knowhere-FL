@@ -252,8 +252,8 @@ TEST_CASE("FL_IVF_FLAT full scan preserves filters padding and device failure fa
             REQUIRE(device.has_value());
             // A failed BF specialization must rebuild candidates and scan CPU.
             auto failed_ops = *host_ops;
-            failed_ops.brute_force_topk = [](const void*, int64_t, const void*, int64_t, int64_t, int64_t, int,
-                                              float*, int64_t*, void*) { return -1; };
+            failed_ops.brute_force_topk = [](const void*, int64_t, const void*, int64_t, int64_t, int64_t, int, float*,
+                                             int64_t*, void*) { return -1; };
             knowhere::fl::RegisterDeviceOps(&failed_ops);
             auto fallback = index.Search(query, cfg, nullptr);
             knowhere::fl::RegisterDeviceOps(host_ops);
@@ -261,11 +261,12 @@ TEST_CASE("FL_IVF_FLAT full scan preserves filters padding and device failure fa
             for (int64_t q = 0; q < 3; ++q) {
                 for (int64_t rank = 0; rank < k; ++rank) {
                     REQUIRE(device.value()->GetIds()[q * k + rank] == fallback.value()->GetIds()[q * k + rank]);
-                    if (rank >= 67) REQUIRE(device.value()->GetIds()[q * k + rank] == -1);
+                    if (rank >= 67)
+                        REQUIRE(device.value()->GetIds()[q * k + rank] == -1);
                 }
             }
             std::vector<uint8_t> bits((67 + 7) / 8, 0xff);
-            bits[0] &= ~uint8_t(1);  // Only row zero remains eligible.
+            bits[0] &= ~uint8_t(1);        // Only row zero remains eligible.
             bits.back() &= uint8_t(0x07);  // Padding bits are outside the 67-row filter.
             auto filtered = index.Search(query, cfg, knowhere::BitsetView(bits.data(), 67));
             REQUIRE(filtered.has_value());
@@ -303,15 +304,20 @@ TEST_CASE("FL_IVF_FLAT large CSR copy preserves candidate order across thread li
     };
     // The adapter outlives all buffers owned by the node.
     knowhere::fl::RegisterDeviceOps(&capture_ops);
-    constexpr int64_t nb = 16384, nq = 100, dim = 1, nlist = 8;
-    std::vector<float> centroids(nlist), xb(nb), queries(nq, 0.f);
-    std::iota(centroids.begin(), centroids.end(), 0.f);
+    constexpr int64_t nb = 16384, nq = 100, nlist = 64;
+    // Exercise serial and parallel routing as well as the CSR copy threshold.
+    const int64_t dim = GENERATE(1, 128);
+    const int32_t metric = GENERATE(0, 1);
+    const std::string metric_name = metric == 0 ? "L2" : "IP";
+    std::vector<float> centroids(nlist * dim, 0.f), xb(nb * dim), queries(nq * dim, 0.f);
+    for (int64_t list = 0; list < nlist; ++list) centroids[list * dim] = static_cast<float>(metric == 0 ? list : -list);
+    if (metric == 1)
+        for (int64_t q = 0; q < nq; ++q) queries[q * dim] = 1.f;
     knowhere::MemoryIOWriter writer;
     knowhere::fl::WriteFormatHeader(writer);
     writer(&dim, sizeof(dim), 1);
     writer(&nb, sizeof(nb), 1);
     writer(&nlist, sizeof(nlist), 1);
-    const int32_t metric = 0;
     writer(&metric, sizeof(metric), 1);
     writer(centroids.data(), sizeof(float), centroids.size());
     writer(xb.data(), sizeof(float), xb.size());
@@ -323,12 +329,12 @@ TEST_CASE("FL_IVF_FLAT large CSR copy preserves candidate order across thread li
     knowhere::BinarySet binary;
     binary.Append(knowhere::IndexEnum::INDEX_FL_IVFFLAT, std::shared_ptr<uint8_t[]>(writer.data()), writer.tellg());
     auto index = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
-    REQUIRE(index.Deserialize(binary, {{"metric_type", "L2"}, {"dim", dim}, {"nlist", nlist}}) ==
+    REQUIRE(index.Deserialize(binary, {{"metric_type", metric_name}, {"dim", dim}, {"nlist", nlist}}) ==
             knowhere::Status::success);
     auto query = knowhere::GenDataSet(nq, dim, queries.data());
-    // Probe 5 is below the parallel threshold; probe 6 is above it.
-    for (int64_t probe : {5, 6}) {
-        const knowhere::Json config = {{"metric_type", "L2"}, {"k", 1}, {"nprobe", probe}};
+    // Probe 40 is below the parallel copy threshold; probe 42 is above it.
+    for (int64_t probe : {40, 42}) {
+        const knowhere::Json config = {{"metric_type", metric_name}, {"k", 1}, {"nprobe", probe}};
         omp_set_num_threads(1);
         REQUIRE(index.Search(query, config, nullptr).has_value());
         const auto serial_ids = captured_ids;
@@ -350,15 +356,82 @@ TEST_CASE("FL_IVF_FLAT large CSR copy preserves candidate order across thread li
                 }
             }
         }
+        std::vector<uint8_t> bits((nb + 7) / 8, 0xaa);  // Exclude odd row IDs.
+        const auto mask = knowhere::BitsetView(bits.data(), nb);
+        omp_set_num_threads(1);
+        REQUIRE(index.Search(query, config, mask).has_value());
+        const auto filtered_ids = captured_ids;
+        const auto filtered_offsets = captured_offsets;
+        std::vector<int64_t> expected;
+        std::copy_if(serial_ids.begin(), serial_ids.end(), std::back_inserter(expected),
+                     [](int64_t id) { return id % 2 == 0; });
+        REQUIRE(filtered_ids == expected);
+        for (int threads : {2, 8, 88}) {
+            omp_set_num_threads(threads);
+            REQUIRE(index.Search(query, config, mask).has_value());
+            REQUIRE(captured_ids == filtered_ids);
+            REQUIRE(captured_offsets == filtered_offsets);
+        }
     }
     // A failed device scan must read the same fully initialized CSR on CPU.
     capture_ops.ivf_flat_scan = [](const void*, int64_t, int64_t, const void*, int64_t, const int64_t*, const int64_t*,
                                    int64_t, int, float*, int64_t*, void*) { return -1; };
-    const auto fallback = index.Search(query, {{"metric_type", "L2"}, {"k", 1}, {"nprobe", 6}}, nullptr);
+    const auto fallback = index.Search(query, {{"metric_type", metric_name}, {"k", 1}, {"nprobe", 6}}, nullptr);
     REQUIRE(fallback.has_value());
     for (int64_t q = 0; q < nq; ++q) {
         REQUIRE(fallback.value()->GetIds()[q] == 0);
         REQUIRE(fallback.value()->GetDistance()[q] == 0.f);
+    }
+}
+
+TEST_CASE("FL_IVF_FLAT search config preserves probes above the train-only default", "[fl][ivf-nprobe]") {
+    knowhere::FlIvfFlatConfig config;
+    config.metric_type = "L2";
+    config.nprobe = 1024;
+    REQUIRE(config.CheckAndAdjust(knowhere::PARAM_TYPE::SEARCH, nullptr) == knowhere::Status::success);
+    REQUIRE(config.nprobe.value() == 1024);
+}
+
+TEST_CASE("FL_IVF_FLAT full probes use the trained list count above 128", "[fl][ivf-nprobe]") {
+    struct RestoreDeviceOps {
+        const knowhere::fl::FlDeviceOps* saved = knowhere::fl::GetDeviceOps();
+        RestoreDeviceOps() {
+            knowhere::fl::RegisterDeviceOps(nullptr);
+        }
+        ~RestoreDeviceOps() {
+            knowhere::fl::RegisterDeviceOps(saved);
+        }
+    } restore;
+    constexpr int64_t nb = 256, dim = 1, nlist = 256;
+    const int32_t metric = 0;
+    std::vector<float> centroids(nlist), xb(nb, 2.f);
+    std::iota(centroids.begin(), centroids.end(), 0.f);
+    xb.back() = 0.f;  // The exact neighbor belongs to the last probed list.
+    knowhere::MemoryIOWriter writer;
+    knowhere::fl::WriteFormatHeader(writer);
+    writer(&dim, sizeof(dim), 1);
+    writer(&nb, sizeof(nb), 1);
+    writer(&nlist, sizeof(nlist), 1);
+    writer(&metric, sizeof(metric), 1);
+    writer(centroids.data(), sizeof(float), centroids.size());
+    writer(xb.data(), sizeof(float), xb.size());
+    for (int64_t id = 0; id < nb; ++id) {
+        const int64_t count = 1;
+        writer(&count, sizeof(count), 1);
+        writer(&id, sizeof(id), 1);
+    }
+    knowhere::BinarySet binary;
+    binary.Append(knowhere::IndexEnum::INDEX_FL_IVFFLAT, std::shared_ptr<uint8_t[]>(writer.data()), writer.tellg());
+    auto index = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
+    REQUIRE(index.Deserialize(binary, {{"metric_type", "L2"}, {"dim", dim}, {"nlist", nlist}}) ==
+            knowhere::Status::success);
+    float q = 0.f;
+    auto query = knowhere::GenDataSet(1, dim, &q);
+    for (int64_t probe : {128, 256, 512}) {
+        auto result = index.Search(query, {{"metric_type", "L2"}, {"k", 1}, {"nprobe", probe}}, nullptr);
+        REQUIRE(result.has_value());
+        REQUIRE(result.value()->GetIds()[0] == (probe == 128 ? 0 : 255));
+        REQUIRE(result.value()->GetDistance()[0] == (probe == 128 ? 4.f : 0.f));
     }
 }
 
@@ -505,15 +578,15 @@ TEST_CASE("FL_IVF_FLAT device-assign and CPU routing agree", "[fl]") {
                           kNb, kNq, kDim, kK, /*is_ip=*/false);
 
     auto idx_dev = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
-    REQUIRE(idx_dev.Build(base, knowhere::Json::parse(
-                                      R"({"metric_type":"L2","dim":16,"nlist":16,"use_device_assign":true})")) ==
+    REQUIRE(idx_dev.Build(
+                base, knowhere::Json::parse(R"({"metric_type":"L2","dim":16,"nlist":16,"use_device_assign":true})")) ==
             knowhere::Status::success);
     auto res_dev = idx_dev.Search(query, search, nullptr);
     REQUIRE(res_dev.has_value());
 
     auto idx_cpu = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
-    REQUIRE(idx_cpu.Build(base, knowhere::Json::parse(
-                                      R"({"metric_type":"L2","dim":16,"nlist":16,"use_device_assign":false})")) ==
+    REQUIRE(idx_cpu.Build(
+                base, knowhere::Json::parse(R"({"metric_type":"L2","dim":16,"nlist":16,"use_device_assign":false})")) ==
             knowhere::Status::success);
     auto res_cpu = idx_cpu.Search(query, search, nullptr);
     REQUIRE(res_cpu.has_value());
@@ -716,7 +789,8 @@ TEST_CASE("FL nodes expose static load-resource estimates", "[fl]") {
     const int64_t kRows = 1000, kDimV = 16;
 
     auto bf_res = knowhere::FlBruteForceIndexNode<knowhere::fp32>::StaticEstimateLoadResource(
-        kFileSize, kRows, kDimV, *knowhere::FlBruteForceIndexNode<knowhere::fp32>::StaticCreateConfig(), IndexVersion(0));
+        kFileSize, kRows, kDimV, *knowhere::FlBruteForceIndexNode<knowhere::fp32>::StaticCreateConfig(),
+        IndexVersion(0));
     REQUIRE(bf_res.has_value());
     REQUIRE(bf_res.value().memoryCost == kFileSize);  // raw vectors stage to device 1:1
 

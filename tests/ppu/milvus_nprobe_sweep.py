@@ -3,6 +3,7 @@
 # Licensed under the Apache License, Version 2.0.
 """Milvus RPC sweep: persistent isolated collections, paired queries, raw samples."""
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -31,10 +32,14 @@ def main():
     connections.connect(host="127.0.0.1", port=args.port)
     rng = np.random.default_rng(42)
     base = rng.uniform(-1, 1, (args.nb, 128)).astype(np.float32)
-    query = rng.uniform(-1, 1, (args.nq, 128)).astype(np.float32).tolist()
+    # Keep queries identical across base sizes; use an independent RNG stream.
+    query_array = np.random.default_rng(43).uniform(-1, 1, (args.nq, 128)).astype(np.float32)
+    query = query_array.tolist()
     report = {"revision": args.revision, "server": utility.get_server_version(),
               "nb": args.nb, "nq": args.nq, "dim": 128, "k": 10,
-              "nlist": args.nlist, "seed": 42, "concurrency": 1,
+              "nlist": args.nlist, "seed": 42, "query_seed": 43, "concurrency": 1,
+              "base_sha256": hashlib.sha256(base.tobytes()).hexdigest(),
+              "query_sha256": hashlib.sha256(query_array.tobytes()).hexdigest(),
               "timing_boundary": "pymilvus RPC incl serialization, service, D2H; query list conversion excluded",
               "rows": []}
     truth = None
@@ -47,10 +52,12 @@ def main():
                       FieldSchema("vec", DataType.FLOAT_VECTOR, dim=128)]
             coll = Collection(name, CollectionSchema(fields))
             coll.set_properties({"collection.autocompaction.enabled": "false"})
+            begin = time.perf_counter()
             for start in range(0, args.nb, 10000):
                 stop = min(start + 10000, args.nb)
                 coll.insert([list(range(start, stop)), base[start:stop].tolist()])
             coll.flush()
+            insert_flush_s = time.perf_counter() - begin
             params = {"nlist": args.nlist} if "IVF" in index else {}
             begin = time.perf_counter()
             coll.create_index("vec", {"index_type": index, "metric_type": "L2", "params": params})
@@ -58,7 +65,10 @@ def main():
         else:
             coll = Collection(name)
             build_s = None
+            insert_flush_s = None
+        begin = time.perf_counter()
         coll.load()
+        load_ready_s = time.perf_counter() - begin
         try:
             segment_before = sorted((s.segmentID, s.num_rows) for s in utility.get_query_segment_info(name))
             if sum(rows for _, rows in segment_before) != args.nb:
@@ -86,8 +96,17 @@ def main():
                         raise RuntimeError("Search returned an unexpected nq/top-k shape")
                     if any(len(set(hits)) != 10 for hits in sample_ids):
                         raise RuntimeError("Search returned duplicate IDs")
+                    if any(id_ < 0 or id_ >= args.nb for hits in sample_ids for id_ in hits):
+                        raise RuntimeError("Search returned an out-of-domain ID")
                     if not np.isfinite(sample_scores).all():
                         raise RuntimeError("Search returned non-finite scores")
+                    # IVF approximation affects candidate selection, not the
+                    # exact FP32 distances of returned IVF_FLAT neighbors.
+                    selected = base[np.asarray(sample_ids, dtype=np.int64)]
+                    differences = selected - query_array[:, None, :]
+                    expected_scores = np.sum(differences * differences, axis=2)
+                    if not np.allclose(sample_scores, expected_scores, rtol=1e-4, atol=1e-4):
+                        raise RuntimeError("Returned scores differ from original-vector L2 oracle")
                     if sample_results and sample_ids != sample_results[0]["ids"]:
                         raise RuntimeError("Search IDs changed across repeats")
                     sample_results.append({"ids": sample_ids, "scores": sample_scores})
@@ -112,12 +131,19 @@ def main():
                 segment_after = sorted((s.segmentID, s.num_rows) for s in utility.get_query_segment_info(name))
                 if segment_after != segment_before:
                     raise RuntimeError("Segment layout changed during the timed sweep")
-                row = {"index": index, "nprobe": probe, "build_s": build_s,
+                row = {"index": index, "nprobe": probe,
+                       "create_index_complete_s": build_s, "insert_flush_s": insert_flush_s,
+                       "load_ready_s": load_ready_s,
+                       "build_timing_boundary": "client create_index completion including RPC, queue and polling; not Train/Add only",
                        "segments": segment_before, "sample_results": sample_results,
                        "score_tolerance": {"rtol": 1e-4, "atol": 1e-4},
                        "samples_s": samples, "request_windows_us": windows,
                        "batch_p50_ms": float(np.median(samples) * 1000),
-                       "qps": args.nq / float(np.median(samples)), "recall_at_10": recall,
+                       "batch_p95_ms": float(np.percentile(samples, 95) * 1000),
+                       "batch_min_ms": float(min(samples) * 1000),
+                       "batch_max_ms": float(max(samples) * 1000),
+                       "batch_throughput_qps_p50": args.nq / float(np.median(samples)),
+                       "recall_at_10": recall,
                        "ordered_align": sum(a == b for g, t in zip(truth, ids) for a, b in zip(g, t)) / (args.nq * 10),
                        "per_query_hits": per_query_hits, "recall_regression_queries": regressions,
                        "result_ids": ids}

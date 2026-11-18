@@ -41,8 +41,9 @@ struct FlIvfFlatConfig : public BaseConfig {
             .for_search()
             .set_range(1, 65536);
         KNOWHERE_CONFIG_DECLARE_FIELD(use_device_assign)
-            .description("route vectors to centroids on the FL device during kmeans/add "
-                         "(mm+argmin composition, no atomics); set false to force CPU routing")
+            .description(
+                "route vectors to centroids on the FL device during kmeans/add "
+                "(mm+argmin composition, no atomics); set false to force CPU routing")
             .set_default(true)
             .for_train();
     }
@@ -59,9 +60,8 @@ struct FlIvfFlatConfig : public BaseConfig {
                 return HandleError(err_msg, msg, Status::invalid_metric_type);
             }
         }
-        if (param_type == PARAM_TYPE::SEARCH && nprobe.value() > nlist.value()) {
-            nprobe = nlist.value();
-        }
+        // Search configs do not carry the trained nlist. The node clamps
+        // nprobe against its actual list count, not this train-only default.
         return Status::success;
     }
 };

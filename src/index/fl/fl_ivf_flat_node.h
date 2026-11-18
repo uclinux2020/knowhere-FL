@@ -328,9 +328,8 @@ class FlIvfFlatIndexNode : public IndexNode {
         }
         if (!fl::ReadChecked(reader, &dim_, sizeof(dim_), 1) || !fl::ReadChecked(reader, &nb_, sizeof(nb_), 1) ||
             !fl::ReadChecked(reader, &nlist_, sizeof(nlist_), 1) ||
-            !fl::ReadChecked(reader, &metric_code_, sizeof(metric_code_), 1) ||
-            !fl::FlScalarDimsSane(dim_, nb_) || nlist_ <= 0 || nlist_ > nb_ ||
-            (metric_code_ != 0 && metric_code_ != 1)) {
+            !fl::ReadChecked(reader, &metric_code_, sizeof(metric_code_), 1) || !fl::FlScalarDimsSane(dim_, nb_) ||
+            nlist_ <= 0 || nlist_ > nb_ || (metric_code_ != 0 && metric_code_ != 1)) {
             LOG_KNOWHERE_WARNING_ << "FL IVF_FLAT deserialize: corrupt header";
             return Status::invalid_binary_set;
         }
@@ -553,8 +552,7 @@ class FlIvfFlatIndexNode : public IndexNode {
                 fl::FlMemoryPool::Instance().TryReserve(x_bytes + c_bytes)) {
                 void* d_x = ops->malloc(x_bytes);
                 void* d_c = ops->malloc(c_bytes);
-                const bool ok = d_x != nullptr && d_c != nullptr &&
-                                ops->memcpy_h2d(d_x, x, x_bytes, nullptr) == 0 &&
+                const bool ok = d_x != nullptr && d_c != nullptr && ops->memcpy_h2d(d_x, x, x_bytes, nullptr) == 0 &&
                                 ops->memcpy_h2d(d_c, centroids_.data(), c_bytes, nullptr) == 0 &&
                                 ops->kmeans_assign(d_x, nb, dim_, d_c, nlist_, metric_code_, out, nullptr) == 0;
                 if (d_x != nullptr) {
@@ -590,8 +588,7 @@ class FlIvfFlatIndexNode : public IndexNode {
             for (int64_t d = 0; d < dim_; ++d) {
                 dot += v[d] * c[d];
             }
-            const float score =
-                metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot);
+            const float score = metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot);
             if ((metric_code_ == 1 && score > best_score) || (metric_code_ == 0 && score < best_score)) {
                 best_score = score;
                 best = l;
@@ -625,31 +622,40 @@ class FlIvfFlatIndexNode : public IndexNode {
                         double* materialize_ms, std::unique_ptr<int64_t[]>& unfiltered_ids) const {
         using Clock = std::chrono::steady_clock;
         const auto started = route_ms ? Clock::now() : Clock::time_point{};
-        std::vector<std::vector<int64_t>> probes(nq);
-#pragma omp parallel for schedule(static) if (nq > 1 && nlist_ > 8388608 / dim_ / nq)
-        for (int64_t i = 0; i < nq; ++i) {
+        std::vector<int64_t> probes(static_cast<size_t>(nq) * nprobe);
+        // Bound the routing team by both available queries and useful work.
+        // Reuse one score buffer per worker instead of allocating per query.
+        const double routing_work = static_cast<double>(nlist_) * dim_ * nq;
+        const int route_threads = static_cast<int>(
+            std::max<double>(1, std::min<double>({static_cast<double>(nq), static_cast<double>(omp_get_max_threads()),
+                                                  32, routing_work / 262144})));
+#pragma omp parallel num_threads(route_threads) if (route_threads > 1)
+        {
             std::vector<std::pair<float, int64_t>> scores(nlist_);
-            const float* q = xq + i * dim_;
-            // Route score: IP uses the raw dot; L2 uses ||c||^2 - 2*q.c from
-            // the cached centroid norms (the query norm is a constant offset
-            // across centroids and does not affect probe selection).
-            for (int64_t l = 0; l < nlist_; ++l) {
-                const float* c = centroids_.data() + l * dim_;
-                float dot = 0.f;
-                for (int64_t d = 0; d < dim_; ++d) {
-                    dot += q[d] * c[d];
+#pragma omp for schedule(static)
+            for (int64_t i = 0; i < nq; ++i) {
+                const float* q = xq + i * dim_;
+                // Route score: IP uses the raw dot; L2 uses ||c||^2 - 2*q.c from
+                // the cached centroid norms (the query norm is a constant offset
+                // across centroids and does not affect probe selection).
+                for (int64_t l = 0; l < nlist_; ++l) {
+                    const float* c = centroids_.data() + l * dim_;
+                    float dot = 0.f;
+                    for (int64_t d = 0; d < dim_; ++d) {
+                        dot += q[d] * c[d];
+                    }
+                    scores[l] = {metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot), l};
                 }
-                scores[l] = {metric_code_ == 1 ? dot : (cent_norms_[static_cast<size_t>(l)] - 2.f * dot), l};
-            }
-            const bool is_ip = metric_code_ == 1;
-            std::partial_sort(
-                scores.begin(), scores.begin() + nprobe, scores.end(), [is_ip](const auto& a, const auto& b) {
-                    // A total order keeps probe prefixes nested even when centroids tie.
-                    return a.first == b.first ? a.second < b.second : is_ip ? a.first > b.first : a.first < b.first;
-                });
-            auto& pl = probes[i];
-            for (int64_t p = 0; p < nprobe; ++p) {
-                pl.push_back(scores[p].second);
+                const bool is_ip = metric_code_ == 1;
+                std::partial_sort(
+                    scores.begin(), scores.begin() + nprobe, scores.end(), [is_ip](const auto& a, const auto& b) {
+                        // A total order keeps probe prefixes nested even when centroids tie.
+                        return a.first == b.first ? a.second < b.second : is_ip ? a.first > b.first : a.first < b.first;
+                    });
+                auto* pl = probes.data() + i * nprobe;
+                for (int64_t p = 0; p < nprobe; ++p) {
+                    pl[p] = scores[p].second;
+                }
             }
         }
         const auto routed = route_ms ? Clock::now() : Clock::time_point{};
@@ -661,7 +667,8 @@ class FlIvfFlatIndexNode : public IndexNode {
             cand_offsets[0] = 0;
             for (int64_t i = 0; i < nq; ++i) {
                 int64_t count = 0;
-                for (const int64_t l : probes[i]) count += static_cast<int64_t>(invlists_[l].size());
+                for (int64_t p = 0; p < nprobe; ++p)
+                    count += static_cast<int64_t>(invlists_[probes[i * nprobe + p]].size());
                 if (count > std::numeric_limits<int64_t>::max() - cand_offsets[i]) {
                     throw std::overflow_error("FL IVF candidate size overflow");
                 }
@@ -677,8 +684,8 @@ class FlIvfFlatIndexNode : public IndexNode {
 #pragma omp parallel for schedule(static) num_threads(copy_threads) if (cand_offsets[nq] >= 1048576 && copy_threads > 1)
             for (int64_t i = 0; i < nq; ++i) {
                 auto position = cand_offsets[i];
-                for (const int64_t l : probes[i]) {
-                    const auto& list = invlists_[l];
+                for (int64_t p = 0; p < nprobe; ++p) {
+                    const auto& list = invlists_[probes[i * nprobe + p]];
                     if (!list.empty())
                         std::copy(list.begin(), list.end(), output + position);
                     position += static_cast<int64_t>(list.size());
@@ -690,8 +697,8 @@ class FlIvfFlatIndexNode : public IndexNode {
         }
         for (int64_t i = 0; i < nq; ++i) {
             cand_offsets[i] = static_cast<int64_t>(cand_ids.size());
-            for (const int64_t l : probes[i]) {
-                const auto& list = invlists_[l];
+            for (int64_t p = 0; p < nprobe; ++p) {
+                const auto& list = invlists_[probes[i * nprobe + p]];
                 for (const int64_t id : list) {
                     if (!bitset.test(id))
                         cand_ids.push_back(id);
@@ -801,10 +808,10 @@ class FlIvfFlatIndexNode : public IndexNode {
     int64_t nlist_{0};
     int metric_code_{0};             // 0 = L2, 1 = IP
     bool use_device_assign_{true};   // device centroid routing (train/add)
-    std::vector<float> centroids_;           // nlist * dim
-    std::vector<float> cent_norms_;          // cached ||c_l||^2 (L2 routing; empty for IP)
-    std::vector<float> host_xb_;             // nb * dim
-    std::vector<int64_t> assign_;            // nb -> list id
+    std::vector<float> centroids_;   // nlist * dim
+    std::vector<float> cent_norms_;  // cached ||c_l||^2 (L2 routing; empty for IP)
+    std::vector<float> host_xb_;     // nb * dim
+    std::vector<int64_t> assign_;    // nb -> list id
     std::vector<std::vector<int64_t>> invlists_;
     fl::FlDeviceBuffer dev_xb_;
     bool dev_ready_{false};

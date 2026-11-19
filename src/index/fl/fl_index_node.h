@@ -59,6 +59,7 @@ class FlBruteForceIndexNode : public IndexNode {
  public:
     FlBruteForceIndexNode(const int32_t version, const Object& object) : IndexNode(version) {
         static_assert(std::is_same_v<DataType, fp32>, "FlBruteForceIndexNode currently supports fp32 only");
+        fl::FlDeviceRouter::Instance().Preflight();
     }
 
     Status

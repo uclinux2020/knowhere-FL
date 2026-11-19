@@ -17,7 +17,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <string>
+#include <thread>
 #include <set>
 #include <utility>
 #include <vector>
@@ -36,7 +42,105 @@
 #include "knowhere/index/index_factory.h"
 #include "utils.h"
 
+namespace knowhere::fl {
+// Serial test-only reset: no index or worker may outlive this fixture.
+struct FlDeviceRouterTestAccess {
+    static void Clear() {
+        auto& router = FlDeviceRouter::Instance();
+        router.initialized_.~once_flag();
+        new (&router.initialized_) std::once_flag;
+        router.ids_.clear();
+        router.error_.clear();
+        router.configured_ = false;
+        router.Reset();
+    }
+};
+}  // namespace knowhere::fl
+
 namespace {
+
+struct DeviceAllowlistFixture {
+    const knowhere::fl::FlDeviceOps* saved_ops{knowhere::fl::GetDeviceOps()};
+    bool had_env{std::getenv("KNOWHERE_FL_DEVICE_IDS") != nullptr};
+    std::string saved_env{had_env ? std::getenv("KNOWHERE_FL_DEVICE_IDS") : ""};
+    knowhere::fl::FlDeviceOps ops{};
+    inline static thread_local int current_device = -1;
+    inline static std::mutex observed_mutex;
+    inline static std::vector<int> observed;
+    inline static std::vector<int> search_devices;
+    inline static knowhere::fl::FlDeviceOps host_ops{};
+
+    template <typename Fn, typename... Args>
+    static int ObserveSearchContext(Fn fn, Args... args) {
+        {
+            std::lock_guard<std::mutex> lock(observed_mutex);
+            search_devices.push_back(current_device);
+        }
+        const int result = fn(args...);
+        // A subsequent search must bind its context, not inherit a worker's previous one.
+        current_device = -1;
+        return result;
+    }
+
+    DeviceAllowlistFixture() {
+        unsetenv("KNOWHERE_FL_DEVICE_IDS");
+        knowhere::fl::FlDeviceRouterTestAccess::Clear();
+        knowhere::fl::RegisterHostAdapter();
+        ops = *knowhere::fl::GetDeviceOps();
+        host_ops = ops;
+        ops.brute_force_topk = [](const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int64_t k,
+                                  int metric, float* distances, int64_t* ids, void* stream) {
+            return ObserveSearchContext(host_ops.brute_force_topk, xb, nb, xq, nq, dim, k, metric, distances, ids,
+                                        stream);
+        };
+        ops.ivf_flat_scan = [](const void* xb, int64_t nb, int64_t dim, const void* xq, int64_t nq,
+                              const int64_t* candidates, const int64_t* offsets, int64_t k, int metric,
+                              float* distances, int64_t* ids, void* stream) {
+            return ObserveSearchContext(host_ops.ivf_flat_scan, xb, nb, dim, xq, nq, candidates, offsets, k, metric,
+                                        distances, ids, stream);
+        };
+        ops.ivf_pq_scan = [](const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, const void* codes,
+                            int64_t nb, const void* xq, int64_t nq, int64_t dim, const int64_t* candidates,
+                            const int64_t* offsets, int64_t k, int metric, float* distances, int64_t* ids,
+                            void* stream) {
+            return ObserveSearchContext(host_ops.ivf_pq_scan, codebooks, m, ksub, dsub, codes, nb, xq, nq, dim,
+                                        candidates, offsets, k, metric, distances, ids, stream);
+        };
+        ops.graph_search = [](const void* xb, int64_t nb, int64_t dim, const int64_t* graph_ids,
+                             const int64_t* graph_offsets, int64_t degree, const void* xq, int64_t nq, int64_t k,
+                             int64_t itopk, int metric, float* distances, int64_t* ids, void* stream) {
+            return ObserveSearchContext(host_ops.graph_search, xb, nb, dim, graph_ids, graph_offsets, degree, xq,
+                                        nq, k, itopk, metric, distances, ids, stream);
+        };
+        ops.device_count = [] { return 8; };
+        ops.set_device = [](int id) {
+            current_device = id;
+            std::lock_guard<std::mutex> lock(observed_mutex);
+            observed.push_back(id);
+            return id >= 0 && id < 8 ? 0 : -1;
+        };
+        observed.clear();
+        knowhere::fl::RegisterDeviceOps(&ops);
+    }
+    void Configure(const char* value) {
+        knowhere::fl::FlDeviceRouterTestAccess::Clear();
+        if (value) {
+            setenv("KNOWHERE_FL_DEVICE_IDS", value, 1);
+        } else {
+            unsetenv("KNOWHERE_FL_DEVICE_IDS");
+        }
+        observed.clear();
+    }
+    ~DeviceAllowlistFixture() {
+        knowhere::fl::FlDeviceRouterTestAccess::Clear();
+        if (had_env) {
+            setenv("KNOWHERE_FL_DEVICE_IDS", saved_env.c_str(), 1);
+        } else {
+            unsetenv("KNOWHERE_FL_DEVICE_IDS");
+        }
+        knowhere::fl::RegisterDeviceOps(saved_ops);
+    }
+};
 
 constexpr int64_t kNb = 2000;
 constexpr int64_t kDim = 16;
@@ -718,6 +822,136 @@ TEST_CASE("FL_IVF_PQ rejects invalid train params", "[fl]") {
     // are lost to quantization); FL IVF_PQ is L2-only
     knowhere::Json ip = knowhere::Json::parse(R"({"metric_type":"IP","dim":16,"nlist":16,"m":4,"nbits":8})");
     REQUIRE(idx.Build(base, ip) == knowhere::Status::invalid_metric_type);
+}
+
+TEST_CASE("FL device allowlist rejects malformed physical IDs", "[fl][device-allowlist]") {
+    using Router = knowhere::fl::FlDeviceRouter;
+    REQUIRE(Router::ParseDeviceIds("6", 8) == std::vector<int>{6});
+    REQUIRE(Router::ParseDeviceIds("7,0,6", 8) == std::vector<int>{7, 0, 6});
+    for (const auto* raw : {"", ",", "0,", ",0", "0,,1", "0,0", "06,6", "-1", "+1", " 1", "1 ",
+                            "1x", "8", "2147483648", "999999999999999999999999"}) {
+        INFO(raw);
+        REQUIRE_THROWS_AS(Router::ParseDeviceIds(raw, 8), std::invalid_argument);
+    }
+    REQUIRE_THROWS_AS(Router::ParseDeviceIds("0", 0), std::invalid_argument);
+}
+
+TEST_CASE("FL device allowlist freezes physical round-robin and errors", "[fl][device-allowlist]") {
+    DeviceAllowlistFixture fixture;
+    auto& router = knowhere::fl::FlDeviceRouter::Instance();
+    SECTION("unset retains all physical devices") {
+        fixture.Configure(nullptr);
+        for (int i = 0; i < 24; ++i) REQUIRE(router.Acquire() == i % 8);
+    }
+    SECTION("single physical device is not logical zero") {
+        fixture.Configure("6");
+        router.Preflight();
+        setenv("KNOWHERE_FL_DEVICE_IDS", "0", 1);
+        router.Reset();
+        for (int i = 0; i < 24; ++i) REQUIRE(router.Acquire() == 6);
+        REQUIRE(router.DeviceCount() == 8);
+    }
+    SECTION("multi-device order and cross-thread dispatch") {
+        fixture.Configure("7,0,6");
+        for (int expected : {7, 0, 6, 7, 0, 6}) REQUIRE(router.Acquire() == expected);
+        router.Reset();
+        std::vector<int> ids(300);
+        std::vector<std::thread> workers;
+        for (int t = 0; t < 3; ++t) {
+            workers.emplace_back([&, t] {
+                for (int i = t; i < 300; i += 3) ids[i] = router.Acquire();
+            });
+        }
+        for (auto& worker : workers) worker.join();
+        for (int id : {7, 0, 6}) REQUIRE(std::count(ids.begin(), ids.end(), id) == 100);
+    }
+    SECTION("error is sticky after environment repair") {
+        fixture.Configure("8");
+        REQUIRE_THROWS_AS(router.Preflight(), std::invalid_argument);
+        setenv("KNOWHERE_FL_DEVICE_IDS", "6", 1);
+        router.Reset();
+        REQUIRE_THROWS_AS(router.Acquire(), std::invalid_argument);
+    }
+    SECTION("missing adapter is not successful CPU fallback") {
+        fixture.Configure("6");
+        knowhere::fl::RegisterDeviceOps(nullptr);
+        REQUIRE_THROWS_AS(router.Preflight(), std::invalid_argument);
+    }
+    SECTION("unusable device is rejected at initialization") {
+        fixture.Configure("6");
+        fixture.ops.set_device = [](int) { return -1; };
+        REQUIRE_THROWS_AS(router.Preflight(), std::invalid_argument);
+    }
+}
+
+TEST_CASE("FL device allowlist rejects index creation before training or search", "[fl][device-allowlist]") {
+    DeviceAllowlistFixture fixture;
+    const auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+    for (const auto* raw : {"", "0,0", "8", "garbage"}) {
+        fixture.Configure(raw);
+        for (const auto& name : {knowhere::IndexEnum::INDEX_FL_BRUTEFORCE, knowhere::IndexEnum::INDEX_FL_IVFFLAT,
+                                 knowhere::IndexEnum::INDEX_FL_IVFPQ, knowhere::IndexEnum::INDEX_FL_CAGRA,
+                                 knowhere::IndexEnum::INDEX_GPU_IVFFLAT}) {
+            INFO(name);
+            const auto index = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(name, version);
+            REQUIRE_FALSE(index.has_value());
+            REQUIRE(index.what().find("KNOWHERE_FL_DEVICE_IDS") != std::string::npos);
+        }
+        REQUIRE(fixture.observed.empty());
+    }
+}
+
+TEST_CASE("FL allowlist covers training Add Deserialize and cross-thread context", "[fl][device-allowlist]") {
+    DeviceAllowlistFixture fixture;
+    fixture.Configure("6");
+    auto base = GenDataSet(256, kDim, 42);
+    auto queries = GenDataSet(2, kDim, 43);
+    for (const auto& name : {knowhere::IndexEnum::INDEX_FL_BRUTEFORCE, knowhere::IndexEnum::INDEX_FL_IVFFLAT,
+                             knowhere::IndexEnum::INDEX_FL_IVFPQ, knowhere::IndexEnum::INDEX_FL_CAGRA,
+                             knowhere::IndexEnum::INDEX_GPU_IVFFLAT}) {
+        INFO(name);
+        auto index = CreateFlIndex(name);
+        fixture.observed.clear();  // Exclude initialization from lifecycle witnesses.
+        knowhere::Json config = {{"metric_type", "L2"}, {"dim", kDim}};
+        if (name == knowhere::IndexEnum::INDEX_FL_IVFFLAT || name == knowhere::IndexEnum::INDEX_GPU_IVFFLAT) {
+            config["nlist"] = 4;
+            config["use_device_assign"] = true;
+        } else if (name == knowhere::IndexEnum::INDEX_FL_IVFPQ) {
+            config["nlist"] = 4;
+            config["m"] = 4;
+            config["nbits"] = 8;
+        } else if (name == knowhere::IndexEnum::INDEX_FL_CAGRA) {
+            config["graph_degree"] = 16;
+        }
+        REQUIRE(index.Train(base, config) == knowhere::Status::success);
+        const auto after_train = fixture.observed.size();
+        if (name == knowhere::IndexEnum::INDEX_FL_IVFFLAT || name == knowhere::IndexEnum::INDEX_GPU_IVFFLAT)
+            REQUIRE(after_train > 0);
+        REQUIRE(index.Add(base, config) == knowhere::Status::success);
+        REQUIRE(fixture.observed.size() > after_train);
+        knowhere::BinarySet binary;
+        REQUIRE(index.Serialize(binary) == knowhere::Status::success);
+        auto loaded = CreateFlIndex(name);
+        const auto before_load = fixture.observed.size();
+        REQUIRE(loaded.Deserialize(binary, config) == knowhere::Status::success);
+        REQUIRE(fixture.observed.size() > before_load);
+        // Search runs on the registered global pool, not on this caller thread.
+        // Observe TLS inside the adapter callback and require an actual device search.
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            fixture.search_devices.clear();
+            bool success = false;
+            std::thread worker([&] {
+                knowhere::Json search = {{"metric_type", "L2"}, {"k", 10}, {"nprobe", 4}};
+                success = loaded.Search(queries, search, nullptr).has_value();
+            });
+            worker.join();
+            REQUIRE(success);
+            REQUIRE_FALSE(fixture.search_devices.empty());
+            REQUIRE(std::all_of(fixture.search_devices.begin(), fixture.search_devices.end(),
+                                [](int id) { return id == 6; }));
+        }
+        REQUIRE(std::all_of(fixture.observed.begin(), fixture.observed.end(), [](int id) { return id == 6; }));
+    }
 }
 
 TEST_CASE("FL device router round-robin", "[fl]") {

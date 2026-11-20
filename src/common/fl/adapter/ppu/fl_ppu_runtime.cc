@@ -289,7 +289,7 @@ struct Kernel {
     }
 };
 struct Bundle {
-    int64_t dim, k, m, ksub, block, select_block, fused_block, queries_per_block;
+    int64_t dim, k, m, ksub, block, ivf_block, select_block, fused_block, queries_per_block;
     bool implicit_ids = false;
     int metric;
     std::unordered_map<std::string, std::unique_ptr<Kernel>> kernels;
@@ -297,7 +297,8 @@ struct Bundle {
         std::ifstream file(root / "manifest.json");
         nlohmann::json meta;
         file >> meta;
-        if (meta.at("schema") != 1 || meta.at("backend") != "flagtree-ppu" ||
+        const int schema = meta.at("schema");
+        if ((schema != 1 && schema != 2) || meta.at("backend") != "flagtree-ppu" ||
             (meta.at("implementation") != "triton" && meta.at("implementation") != "triton-tle")) {
             throw std::runtime_error("Not a FlagTree PPU Triton bundle");
         }
@@ -307,12 +308,17 @@ struct Bundle {
         m = meta.at("m");
         ksub = meta.at("ksub");
         block = meta.at("block");
+        // Legacy bundles use one tile size for both dense and gathered scores.
+        ivf_block = schema == 2 ? meta.at("ivf_block").get<int64_t>() : meta.value("ivf_block", block);
+        if (schema == 1 && ivf_block != block)
+            throw std::runtime_error("Split PPU score tiles require schema 2");
         select_block = meta.at("select_block");
         fused_block = meta.value("fused_block", 256);
         queries_per_block = meta.value("queries_per_block", 1);
         implicit_ids = meta.value("implicit_ids", false);
         if (dim <= 0 || k <= 0 || 2 * k > select_block || select_block > 65536 || block <= 0 || (block & (block - 1)) ||
-            (select_block & (select_block - 1)) || (metric != 0 && metric != 1) ||
+            (select_block & (select_block - 1)) || ivf_block <= 0 || ivf_block > 65536 ||
+            (ivf_block & (ivf_block - 1)) || (metric != 0 && metric != 1) ||
             (queries_per_block != 1 && queries_per_block != 2 && queries_per_block != 4 && queries_per_block != 16 &&
              queries_per_block != 32) ||
             fused_block <= 0 || (fused_block & (fused_block - 1))) {
@@ -538,7 +544,8 @@ Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int6
             std::fill_n(distances, nq * k, metric == 0 ? INFINITY : -INFINITY);
             return 0;
         }
-        if (width > 65535 * bundle->block)
+        const int64_t score_block = ivf ? bundle->ivf_block : bundle->block;
+        if (width > 65535 * score_block)
             throw std::runtime_error("PPU score grid exceeds supported width");
         const bool implicit = !ivf && !codes && bundle->implicit_ids;
         if (implicit && (!bundle->kernels.count("select_implicit") || !bundle->kernels.count("batched_distance"))) {
@@ -700,7 +707,7 @@ Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int6
             HGdeviceptr vectors = search_vectors, encoded_codes = Ptr(codes);
             HGdeviceptr off_ptr = offset_buffer.ptr;
             int64_t base = 0;
-            unsigned score_grid = static_cast<unsigned>((width + bundle->block - 1) / bundle->block);
+            unsigned score_grid = static_cast<unsigned>((width + score_block - 1) / score_block);
             int64_t fused_tiles = tiles;
             if (compact) {
                 int64_t queries = query_count;

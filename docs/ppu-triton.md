@@ -86,6 +86,16 @@ export KNOWHERE_FL_PPU_KERNEL_DIR="$PWD/build/ppu-kernels"
 详见 [隐式ID及端到端边界报告](ppu-implicit-id-20261116.md)。
 IVF/PQ候选不使用隐式ID，旧manifest仍兼容。
 
+## 独立 IVF/PQ score tile（实验配置）
+
+`compile_ppu.py --ivf-block <power-of-two>` 可独立设置 gathered IVF_FLAT/PQ
+score tile，默认沿用 `--block`。dense BF/k1 与 fused tile 不受此参数影响。
+不同 tile 的 bundle 使用 schema2，必须配套支持 schema2 的 runtime；旧 runtime
+会明确拒绝，而不是忽略字段后漏扫。未拆分配置继续使用 schema1，新 runtime 兼容旧 bundle。
+此参数不改变候选、过滤、k 或索引格式，也不默认推广任何 tile 值。
+实际 FlagFit 1024维/IP/nq1/k20 的限定实验与E2E边界见
+[未开发模块续查](ppu-e2e-module-followup-20261120.md)。
+
 ## 请求内单块工作区
 
 Search将临时设备缓冲合并为一次对齐arena分配，仍在请求结束释放，不缓存查询结果。

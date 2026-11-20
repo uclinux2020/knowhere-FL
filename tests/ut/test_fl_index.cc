@@ -525,6 +525,65 @@ TEST_CASE("FL_IVF_FLAT search config preserves probes above the train-only defau
     REQUIRE(config.nprobe.value() == 1024);
 }
 
+TEST_CASE("FL_IVF_FLAT filtered full probes preserve exact ties and fallback", "[fl][ivf-full-filter]") {
+    DeviceAllowlistFixture fixture;
+    for (const bool fail_scan : {false, true}) {
+        auto ops = fixture.ops;
+        if (fail_scan) {
+            ops.ivf_flat_scan = [](const void*, int64_t, int64_t, const void*, int64_t, const int64_t*, const int64_t*,
+                                   int64_t, int, float*, int64_t*, void*) { return -1; };
+        }
+        knowhere::fl::RegisterDeviceOps(&ops);
+        for (const int metric : {0, 1}) {
+            constexpr int64_t nb = 32, dim = 1, nlist = 8, nq = 2, k = 10;
+            std::vector<float> centroids(nlist), xb(nb, 1.f), queries(nq, 0.5f);
+            // Reverse centroid order deliberately differs from list-ID traversal.
+            for (int64_t l = 0; l < nlist; ++l) centroids[l] = static_cast<float>(nlist - l);
+            knowhere::MemoryIOWriter writer;
+            knowhere::fl::WriteFormatHeader(writer);
+            writer(&dim, sizeof(dim), 1);
+            writer(&nb, sizeof(nb), 1);
+            writer(&nlist, sizeof(nlist), 1);
+            writer(&metric, sizeof(metric), 1);
+            writer(centroids.data(), sizeof(float), centroids.size());
+            writer(xb.data(), sizeof(float), xb.size());
+            for (int64_t l = 0; l < nlist; ++l) {
+                const int64_t count = nb / nlist;
+                writer(&count, sizeof(count), 1);
+                for (int64_t id = l; id < nb; id += nlist) writer(&id, sizeof(id), 1);
+            }
+            knowhere::BinarySet binary;
+            binary.Append(knowhere::IndexEnum::INDEX_FL_IVFFLAT, std::shared_ptr<uint8_t[]>(writer.data()),
+                          writer.tellg());
+            auto idx = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
+            const std::string name = metric ? "IP" : "L2";
+            REQUIRE(idx.Deserialize(binary, {{"metric_type", name}, {"dim", dim}, {"nlist", nlist}}) ==
+                    knowhere::Status::success);
+            for (const int eligible : {0, 3, 16, 32}) {
+                std::vector<uint8_t> bits(nb / 8, 0);
+                for (int64_t id = eligible; id < nb; ++id) bits[id / 8] |= uint8_t{1} << (id % 8);
+                knowhere::BitsetView mask(bits.data(), nb);
+                auto result = idx.Search(knowhere::GenDataSet(nq, dim, queries.data()),
+                                         {{"metric_type", name}, {"k", k}, {"nprobe", nlist}}, mask);
+                REQUIRE(result.has_value());
+                for (int64_t q = 0; q < nq; ++q) {
+                    for (int64_t rank = 0; rank < k; ++rank) {
+                        REQUIRE(result.value()->GetIds()[q * k + rank] == (rank < eligible ? rank : -1));
+                        const float score = result.value()->GetDistance()[q * k + rank];
+                        if (rank < eligible) {
+                            REQUIRE(score == (metric ? 0.5f : 0.25f));
+                        } else {
+                            // Host adapter padding is finite; node fallback uses infinity.
+                            REQUIRE((metric ? score < -1e30f : score > 1e30f));
+                        }
+                    }
+                }
+            }
+        }
+        knowhere::fl::RegisterDeviceOps(&fixture.ops);
+    }
+}
+
 TEST_CASE("FL_IVF_FLAT full probes use the trained list count above 128", "[fl][ivf-nprobe]") {
     struct RestoreDeviceOps {
         const knowhere::fl::FlDeviceOps* saved = knowhere::fl::GetDeviceOps();

@@ -45,6 +45,18 @@ else()
 endif()
 target_link_libraries(knowhere_ppu_assign_matrix_test PRIVATE "${PPU_HG_LIBRARY}")
 
+# Explicit device/shape arguments are required; do not auto-run on device zero.
+add_executable(knowhere_ppu_ivf_tile_test test_ppu_ivf_tile.cc
+  "${KNOWHERE_ROOT}/src/common/fl/adapter/ppu/fl_ppu_runtime.cc")
+target_compile_definitions(knowhere_ppu_ivf_tile_test PRIVATE KNOWHERE_FL_WITH_PPU)
+target_include_directories(knowhere_ppu_ivf_tile_test PRIVATE "${KNOWHERE_ROOT}/src" "${PPU_INCLUDE_DIR}")
+if(nlohmann_json_FOUND)
+  target_link_libraries(knowhere_ppu_ivf_tile_test PRIVATE nlohmann_json::nlohmann_json)
+else()
+  target_include_directories(knowhere_ppu_ivf_tile_test PRIVATE "${NLOHMANN_JSON_INCLUDE_DIR}")
+endif()
+target_link_libraries(knowhere_ppu_ivf_tile_test PRIVATE "${PPU_HG_LIBRARY}")
+
 find_package(OpenMP REQUIRED)
 add_executable(knowhere_ppu_bench bench_ppu_runtime.cc
   "${KNOWHERE_ROOT}/src/common/fl/adapter/ppu/fl_ppu_runtime.cc")

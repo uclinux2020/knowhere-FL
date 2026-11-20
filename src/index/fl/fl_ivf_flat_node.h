@@ -666,6 +666,26 @@ class FlIvfFlatIndexNode : public IndexNode {
                         double* materialize_ms, std::unique_ptr<int64_t[]>& unfiltered_ids) const {
         using Clock = std::chrono::steady_clock;
         const auto started = route_ms ? Clock::now() : Clock::time_point{};
+        if (nprobe == nlist_ && !bitset.empty()) {
+            // Every list is selected: centroid scores cannot change membership.
+            // Traverse lists in ID order, evaluating each filter exactly once
+            // per row/query. Both scanners break score ties by global row ID.
+            if (route_ms)
+                *route_ms = 0;
+            for (int64_t i = 0; i < nq; ++i) {
+                cand_offsets[i] = static_cast<int64_t>(cand_ids.size());
+                for (const auto& list : invlists_) {
+                    for (const int64_t id : list) {
+                        if (!bitset.test(id))
+                            cand_ids.push_back(id);
+                    }
+                }
+            }
+            cand_offsets[nq] = static_cast<int64_t>(cand_ids.size());
+            if (materialize_ms)
+                *materialize_ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+            return;
+        }
         std::vector<int64_t> probes(static_cast<size_t>(nq) * nprobe);
         // Bound the routing team by both available queries and useful work.
         // Reuse one score buffer per worker instead of allocating per query.

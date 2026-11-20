@@ -22,6 +22,8 @@ def main():
     ap.add_argument('--ksub', type=int, default=256)
     ap.add_argument('--block', type=int, default=128)
     ap.add_argument('--select-block', type=int, default=1024)
+    ap.add_argument('--ivf-block', type=int, default=None,
+                    help='Independent IVF/PQ score tile; defaults to --block for compatibility')
     ap.add_argument('--compact-score', action='store_true', help='Select matrix tile top-k before global storage')
     ap.add_argument('--transpose-base', action='store_true', help='Request-owned coalesced matrix base layout')
     ap.add_argument('--num-warps', type=int, choices=[2, 4, 8], default=4)
@@ -33,6 +35,9 @@ def main():
     ap.add_argument('--fused-block', type=int, default=256)
     ap.add_argument('--tle', action='store_true', help='Use Triton-TLE asynchronous vector loads')
     args = ap.parse_args()
+    ivf_block = args.block if args.ivf_block is None else args.ivf_block
+    if ivf_block <= 0 or ivf_block > 65536 or ivf_block & (ivf_block - 1):
+        ap.error('ivf-block must be a power of two in [1, 65536]')
     if args.fused_block <= 0 or args.fused_block & (args.fused_block - 1):
         ap.error('fused-block must be a positive power of two')
     if args.dim <= 0 or not 0 < args.k <= args.select_block // 2:
@@ -92,7 +97,8 @@ def main():
     for ivf in (False, True):
         emit('ivf_flat' if ivf else 'distance', distance_scores, dist_sig,
              {'DIM': args.dim, 'METRIC': metric, 'IVF': ivf,
-              'BLOCK': args.block, 'BD': triton.next_power_of_2(args.dim), 'USE_TLE': args.tle})
+              'BLOCK': ivf_block if ivf else args.block,
+              'BD': triton.next_power_of_2(args.dim), 'USE_TLE': args.tle})
     sel_sig = {'SCORES': '*fp32', 'IDS': '*i64', 'OUT_SCORES': '*fp32',
                'OUT_IDS': '*i64', 'WIDTH': 'i64', 'TILES': 'i64'}
     emit('select', select_topk, sel_sig,
@@ -107,7 +113,7 @@ def main():
                'OFFSETS': '*i64', 'SCORES': '*fp32', 'IDS': '*i64', 'NB': 'i64', 'WIDTH': 'i64', 'BASE': 'i64'}
         emit('pq', pq_scores, sig,
              {'DIM': args.dim, 'M': args.m, 'KSUB': args.ksub, 'DSUB': args.dim // args.m,
-              'METRIC': metric, 'BLOCK': args.block, 'BD': triton.next_power_of_2(args.dim // args.m),
+              'METRIC': metric, 'BLOCK': ivf_block, 'BD': triton.next_power_of_2(args.dim // args.m),
               'USE_TLE': args.tle})
     if args.pq_lut:
         emit('pq_lut', pq_lookup, {'CB': '*fp32', 'XQ': '*fp32', 'LUT': '*fp32'},
@@ -117,7 +123,7 @@ def main():
         emit('pq_adc', pq_adc,
              {'LUT': '*fp32', 'CODES': '*u8', 'CAND': '*i64', 'OFFSETS': '*i64',
               'SCORES': '*fp32', 'IDS': '*i64', 'NB': 'i64', 'WIDTH': 'i64'},
-             {'M': args.m, 'KSUB': args.ksub, 'METRIC': metric, 'BLOCK': args.block})
+             {'M': args.m, 'KSUB': args.ksub, 'METRIC': metric, 'BLOCK': ivf_block})
     if args.m == 0:
         matrix_constants = {'TRANSPOSED': args.transpose_base} if args.matrix else {}
         emit('batched_distance', matrix_distance_scores if args.matrix else batched_distance_scores,
@@ -140,9 +146,12 @@ def main():
     if args.transpose_base:
         emit('transpose_base', transpose_base, {'XB': '*fp32', 'PACKED': '*fp32', 'NB': 'i64'},
              {'DIM': args.dim, 'BN': 32, 'BD': 32})
-    manifest = {'schema': 1, 'backend': 'flagtree-ppu', 'implementation': 'triton-tle' if args.tle else 'triton',
+    # Old runtimes must reject split-tile bundles rather than launch a wrong grid.
+    manifest = {'schema': 2 if ivf_block != args.block else 1,
+                'backend': 'flagtree-ppu', 'implementation': 'triton-tle' if args.tle else 'triton',
                 'dim': args.dim, 'k': args.k, 'metric': metric, 'm': args.m,
-                'ksub': args.ksub, 'block': args.block, 'select_block': args.select_block, 'fused_block': args.fused_block,
+                'ksub': args.ksub, 'block': args.block, 'ivf_block': ivf_block,
+                'select_block': args.select_block, 'fused_block': args.fused_block,
                 'kernels': entries, 'queries_per_block': args.queries_per_block,
                 'implicit_ids': args.implicit_ids, 'transpose_base': args.transpose_base,
                 'distance_implementation': 'matrix-ieee-fp32' if args.matrix else 'direct-fp32'}

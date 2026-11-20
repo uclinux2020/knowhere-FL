@@ -19,6 +19,7 @@
 #include <random>
 #include <vector>
 
+#include "index/fl/fl_centroid_update.h"
 #include "knowhere/log.h"
 
 namespace knowhere {
@@ -40,8 +41,8 @@ inline void
 LloydKmeansCpu(const float* x, int64_t nb, int64_t dim, int64_t nlist, int metric_code, float* centroids,
                int64_t* owner_out = nullptr, int max_iters = 25, uint64_t seed = 42) {
     if (x == nullptr || nb <= 0 || dim <= 0 || nlist <= 0 || centroids == nullptr) {
-        LOG_KNOWHERE_WARNING_ << "FL LloydKmeansCpu: invalid args (nb=" << nb << " dim=" << dim
-                              << " nlist=" << nlist << "); centroids left untouched";
+        LOG_KNOWHERE_WARNING_ << "FL LloydKmeansCpu: invalid args (nb=" << nb << " dim=" << dim << " nlist=" << nlist
+                              << "); centroids left untouched";
         if (owner_out != nullptr && nb > 0) {
             std::fill_n(owner_out, nb, int64_t{0});
         }
@@ -91,8 +92,7 @@ LloydKmeansCpu(const float* x, int64_t nb, int64_t dim, int64_t nlist, int metri
             for (int64_t d = 0; d < dim; ++d) {
                 dot += v[d] * c[d];
             }
-            const float score =
-                metric_code == 1 ? dot : (cent_norms[static_cast<size_t>(l)] - 2.f * dot);
+            const float score = metric_code == 1 ? dot : (cent_norms[static_cast<size_t>(l)] - 2.f * dot);
             if ((metric_code == 1 && score > best_score) || (metric_code == 0 && score < best_score)) {
                 best_score = score;
                 best = l;
@@ -117,15 +117,9 @@ LloydKmeansCpu(const float* x, int64_t nb, int64_t dim, int64_t nlist, int metri
                 changed = true;
             }
         }
-        std::vector<double> sums(static_cast<size_t>(nlist) * dim, 0.0);
-        std::vector<int64_t> counts(nlist, 0);
-        for (int64_t j = 0; j < nb; ++j) {
-            const int64_t c = owner[j];
-            ++counts[c];
-            for (int64_t d = 0; d < dim; ++d) {
-                sums[static_cast<size_t>(c) * dim + d] += x[j * dim + d];
-            }
-        }
+        std::vector<double> sums;
+        std::vector<int64_t> counts;
+        AccumulateCentroids(x, owner.data(), nb, dim, nlist, sums, counts);
         for (int64_t l = 0; l < nlist; ++l) {
             if (counts[l] == 0) {
                 std::memcpy(centroids + l * dim, x + perm[(l + iter + 1) % nb] * dim, dim * sizeof(float));

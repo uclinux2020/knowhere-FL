@@ -22,9 +22,9 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <set>
 #include <string>
 #include <thread>
-#include <set>
 #include <utility>
 #include <vector>
 
@@ -45,7 +45,8 @@
 namespace knowhere::fl {
 // Serial test-only reset: no index or worker may outlive this fixture.
 struct FlDeviceRouterTestAccess {
-    static void Clear() {
+    static void
+    Clear() {
         auto& router = FlDeviceRouter::Instance();
         router.initialized_.~once_flag();
         new (&router.initialized_) std::once_flag;
@@ -71,7 +72,8 @@ struct DeviceAllowlistFixture {
     inline static knowhere::fl::FlDeviceOps host_ops{};
 
     template <typename Fn, typename... Args>
-    static int ObserveSearchContext(Fn fn, Args... args) {
+    static int
+    ObserveSearchContext(Fn fn, Args... args) {
         {
             std::lock_guard<std::mutex> lock(observed_mutex);
             search_devices.push_back(current_device);
@@ -94,23 +96,23 @@ struct DeviceAllowlistFixture {
                                         stream);
         };
         ops.ivf_flat_scan = [](const void* xb, int64_t nb, int64_t dim, const void* xq, int64_t nq,
-                              const int64_t* candidates, const int64_t* offsets, int64_t k, int metric,
-                              float* distances, int64_t* ids, void* stream) {
+                               const int64_t* candidates, const int64_t* offsets, int64_t k, int metric,
+                               float* distances, int64_t* ids, void* stream) {
             return ObserveSearchContext(host_ops.ivf_flat_scan, xb, nb, dim, xq, nq, candidates, offsets, k, metric,
                                         distances, ids, stream);
         };
         ops.ivf_pq_scan = [](const void* codebooks, int64_t m, int64_t ksub, int64_t dsub, const void* codes,
-                            int64_t nb, const void* xq, int64_t nq, int64_t dim, const int64_t* candidates,
-                            const int64_t* offsets, int64_t k, int metric, float* distances, int64_t* ids,
-                            void* stream) {
+                             int64_t nb, const void* xq, int64_t nq, int64_t dim, const int64_t* candidates,
+                             const int64_t* offsets, int64_t k, int metric, float* distances, int64_t* ids,
+                             void* stream) {
             return ObserveSearchContext(host_ops.ivf_pq_scan, codebooks, m, ksub, dsub, codes, nb, xq, nq, dim,
                                         candidates, offsets, k, metric, distances, ids, stream);
         };
         ops.graph_search = [](const void* xb, int64_t nb, int64_t dim, const int64_t* graph_ids,
-                             const int64_t* graph_offsets, int64_t degree, const void* xq, int64_t nq, int64_t k,
-                             int64_t itopk, int metric, float* distances, int64_t* ids, void* stream) {
-            return ObserveSearchContext(host_ops.graph_search, xb, nb, dim, graph_ids, graph_offsets, degree, xq,
-                                        nq, k, itopk, metric, distances, ids, stream);
+                              const int64_t* graph_offsets, int64_t degree, const void* xq, int64_t nq, int64_t k,
+                              int64_t itopk, int metric, float* distances, int64_t* ids, void* stream) {
+            return ObserveSearchContext(host_ops.graph_search, xb, nb, dim, graph_ids, graph_offsets, degree, xq, nq, k,
+                                        itopk, metric, distances, ids, stream);
         };
         ops.device_count = [] { return 8; };
         ops.set_device = [](int id) {
@@ -122,7 +124,8 @@ struct DeviceAllowlistFixture {
         observed.clear();
         knowhere::fl::RegisterDeviceOps(&ops);
     }
-    void Configure(const char* value) {
+    void
+    Configure(const char* value) {
         knowhere::fl::FlDeviceRouterTestAccess::Clear();
         if (value) {
             setenv("KNOWHERE_FL_DEVICE_IDS", value, 1);
@@ -824,12 +827,94 @@ TEST_CASE("FL_IVF_PQ rejects invalid train params", "[fl]") {
     REQUIRE(idx.Build(base, ip) == knowhere::Status::invalid_metric_type);
 }
 
+TEST_CASE("FL centroid updates preserve serial double sums", "[fl][centroid-update]") {
+    const int saved_threads = omp_get_max_threads();
+    struct RestoreThreads {
+        int count;
+        ~RestoreThreads() {
+            omp_set_num_threads(count);
+        }
+    } restore{saved_threads};
+    constexpr int64_t nb = 9000, dim = 129, nlist = 17;
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> random(-1.f, 1.f);
+    std::vector<float> x(nb * dim);
+    for (auto& v : x) v = random(rng);
+    for (bool skewed : {false, true}) {
+        std::vector<int64_t> owner(nb);
+        for (int64_t j = 0; j < nb; ++j) owner[j] = skewed ? 0 : rng() % (nlist - 1);
+        std::vector<double> expected(nlist * dim, 0.0), sums;
+        std::vector<int64_t> expected_counts(nlist, 0), counts;
+        for (int64_t j = 0; j < nb; ++j) {
+            ++expected_counts[owner[j]];
+            for (int64_t d = 0; d < dim; ++d) expected[owner[j] * dim + d] += x[j * dim + d];
+        }
+        for (int threads : {1, 2, 8, 88}) {
+            omp_set_num_threads(threads);
+            knowhere::fl::AccumulateCentroids(x.data(), owner.data(), nb, dim, nlist, sums, counts);
+            REQUIRE(counts == expected_counts);
+            REQUIRE(std::memcmp(sums.data(), expected.data(), sums.size() * sizeof(double)) == 0);
+        }
+    }
+}
+
+TEST_CASE("FL_IVF_FLAT Add reuses resident vectors and preserves fallback", "[fl][add-resident]") {
+    DeviceAllowlistFixture fixture;
+    fixture.Configure("6");
+    static int base_uploads, assign_calls;
+    static bool fail_assign;
+    constexpr int64_t nb = 256, dim = 16, nlist = 8;
+    constexpr size_t base_bytes = nb * dim * sizeof(float);
+    const auto saved_used = knowhere::fl::FlMemoryPool::Instance().Used();
+    fixture.ops.memcpy_h2d = [](void* dst, const void* src, size_t bytes, void* stream) {
+        if (bytes == base_bytes)
+            ++base_uploads;
+        return DeviceAllowlistFixture::host_ops.memcpy_h2d(dst, src, bytes, stream);
+    };
+    fixture.ops.kmeans_assign = [](const void* x, int64_t rows, int64_t width, const void* c, int64_t lists, int metric,
+                                   int64_t* out, void* stream) {
+        ++assign_calls;
+        if (fail_assign)
+            return -1;
+        return DeviceAllowlistFixture::host_ops.kmeans_assign(x, rows, width, c, lists, metric, out, stream);
+    };
+    auto base = GenDataSet(nb, dim, 42);
+    auto query = GenDataSet(2, dim, 43);
+    knowhere::Json config = {{"metric_type", "L2"}, {"dim", dim}, {"nlist", nlist}, {"use_device_assign", false}};
+    std::vector<int64_t> expected;
+    for (bool failure : {false, true}) {
+        // Train with an unavailable callback to keep centroids identical;
+        // re-enable device assignment only for Add.
+        config["use_device_assign"] = true;
+        auto assign_fn = fixture.ops.kmeans_assign;
+        fixture.ops.kmeans_assign = nullptr;
+        {
+            auto index = CreateFlIndex(knowhere::IndexEnum::INDEX_FL_IVFFLAT);
+            REQUIRE(index.Train(base, config) == knowhere::Status::success);
+            fixture.ops.kmeans_assign = assign_fn;
+            base_uploads = assign_calls = 0;
+            fail_assign = failure;
+            REQUIRE(index.Add(base, config) == knowhere::Status::success);
+            REQUIRE(base_uploads == 1);
+            REQUIRE(assign_calls == 1);
+            REQUIRE(knowhere::fl::FlMemoryPool::Instance().Used() == saved_used + base_bytes);
+            auto result = index.Search(query, {{"metric_type", "L2"}, {"k", 10}, {"nprobe", nlist}}, nullptr);
+            REQUIRE(result.has_value());
+            std::vector<int64_t> ids(result.value()->GetIds(), result.value()->GetIds() + 20);
+            if (expected.empty())
+                expected = ids;
+            REQUIRE(ids == expected);
+        }
+        REQUIRE(knowhere::fl::FlMemoryPool::Instance().Used() == saved_used);
+    }
+}
+
 TEST_CASE("FL device allowlist rejects malformed physical IDs", "[fl][device-allowlist]") {
     using Router = knowhere::fl::FlDeviceRouter;
     REQUIRE(Router::ParseDeviceIds("6", 8) == std::vector<int>{6});
     REQUIRE(Router::ParseDeviceIds("7,0,6", 8) == std::vector<int>{7, 0, 6});
-    for (const auto* raw : {"", ",", "0,", ",0", "0,,1", "0,0", "06,6", "-1", "+1", " 1", "1 ",
-                            "1x", "8", "2147483648", "999999999999999999999999"}) {
+    for (const auto* raw : {"", ",", "0,", ",0", "0,,1", "0,0", "06,6", "-1", "+1", " 1", "1 ", "1x", "8", "2147483648",
+                            "999999999999999999999999"}) {
         INFO(raw);
         REQUIRE_THROWS_AS(Router::ParseDeviceIds(raw, 8), std::invalid_argument);
     }

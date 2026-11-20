@@ -32,6 +32,7 @@
 
 #include "common/fl/fl_device.h"
 #include "common/fl/fl_device_router.h"
+#include "index/fl/fl_centroid_update.h"
 #include "index/fl/fl_format.h"
 #include "index/fl/fl_ivf_flat_config.h"
 #include "io/memory_io.h"
@@ -113,6 +114,9 @@ class FlIvfFlatIndexNode : public IndexNode {
         nb_ = rows;
         host_xb_.assign(x, x + static_cast<size_t>(nb_) * dim_);
 
+        // Stage before assignment so Add can reuse the final resident payload
+        // instead of uploading and freeing a second full-sized vector buffer.
+        TryStageToDevice();
         invlists_.assign(nlist_, {});
         assign_.resize(nb_);
         AssignAll(host_xb_.data(), nb_, assign_.data());
@@ -120,7 +124,6 @@ class FlIvfFlatIndexNode : public IndexNode {
             invlists_[assign_[j]].push_back(j);
         }
 
-        TryStageToDevice();
         return Status::success;
     }
 
@@ -506,16 +509,11 @@ class FlIvfFlatIndexNode : public IndexNode {
                     changed = true;
                 }
             }
-            // recompute centroids (CPU; device update needs atomics, see header note)
-            std::vector<double> sums(static_cast<size_t>(nlist_) * dim_, 0.0);
-            std::vector<int64_t> counts(nlist_, 0);
-            for (int64_t j = 0; j < nb; ++j) {
-                const int64_t c = owner[j];
-                ++counts[c];
-                for (int64_t d = 0; d < dim_; ++d) {
-                    sums[static_cast<size_t>(c) * dim_ + d] += x[j * dim_ + d];
-                }
-            }
+            // Stable grouped CPU update keeps each dimension's accumulation
+            // order unchanged while overlapping independent cluster reductions.
+            std::vector<double> sums;
+            std::vector<int64_t> counts;
+            fl::AccumulateCentroids(x, owner.data(), nb, dim_, nlist_, sums, counts);
             for (int64_t l = 0; l < nlist_; ++l) {
                 if (counts[l] == 0) {  // empty cluster: re-seed randomly
                     std::memcpy(centroids_.data() + l * dim_, x + perm[(l + iter + 1) % nb] * dim_,
@@ -541,32 +539,27 @@ class FlIvfFlatIndexNode : public IndexNode {
                            << (staged_bytes != 0 ? " (device assignment)" : " (CPU assignment)");
     }
 
-    // One-shot assignment of vectors to centroids: device kmeans_assign when
-    // available (single upload), CPU parallel routing otherwise.
+    // Reuse the resident base on its owning device; only centroids need a
+    // temporary upload. A failed stage/assignment retains exact CPU routing.
     void
     AssignAll(const float* x, int64_t nb, int64_t* out) const {
-        if (use_device_assign_ && fl::DeviceAvailable()) {
+        if (use_device_assign_ && dev_ready_) {
             const fl::FlDeviceOps* ops = fl::GetDeviceOps();
-            const size_t x_bytes = static_cast<size_t>(nb) * dim_ * sizeof(float);
             const size_t c_bytes = static_cast<size_t>(nlist_) * dim_ * sizeof(float);
             if (ops->kmeans_assign != nullptr && ops->malloc != nullptr && ops->free != nullptr &&
-                ops->memcpy_h2d != nullptr && ops->set_device != nullptr &&
-                ops->set_device(fl::FlDeviceRouter::Instance().Acquire()) == 0 &&
-                fl::FlMemoryPool::Instance().TryReserve(x_bytes + c_bytes)) {
-                void* d_x = ops->malloc(x_bytes);
+                ops->memcpy_h2d != nullptr && ops->set_device != nullptr && ops->set_device(device_id_) == 0 &&
+                fl::FlMemoryPool::Instance().TryReserve(c_bytes)) {
                 void* d_c = ops->malloc(c_bytes);
-                const bool ok = d_x != nullptr && d_c != nullptr && ops->memcpy_h2d(d_x, x, x_bytes, nullptr) == 0 &&
-                                ops->memcpy_h2d(d_c, centroids_.data(), c_bytes, nullptr) == 0 &&
-                                ops->kmeans_assign(d_x, nb, dim_, d_c, nlist_, metric_code_, out, nullptr) == 0;
-                if (d_x != nullptr) {
-                    ops->free(d_x);
-                }
-                if (d_c != nullptr) {
-                    ops->free(d_c);
-                }
-                fl::FlMemoryPool::Instance().TrackFree(x_bytes + c_bytes);  // release reservation
-                if (ok) {
-                    return;
+                if (d_c == nullptr) {
+                    fl::FlMemoryPool::Instance().TrackFree(c_bytes);
+                } else {
+                    fl::FlDeviceBuffer centroids(d_c, c_bytes);
+                    const bool ok =
+                        ops->memcpy_h2d(d_c, centroids_.data(), c_bytes, nullptr) == 0 &&
+                        ops->kmeans_assign(dev_xb_.get(), nb, dim_, d_c, nlist_, metric_code_, out, nullptr) == 0;
+                    if (ok) {
+                        return;
+                    }
                 }
                 LOG_KNOWHERE_WARNING_ << "FL device assignment failed in Add; CPU routing fallback";
             }

@@ -1,5 +1,12 @@
 # PPU (Zhenwu ZW810E) Runtime Shim & Fused Top-K Operator
 
+> **Status note (2026-11-23):** this directory is a historical CUDA-C artifact set kept
+> for reference. `WITH_FL_PPU` builds use the native HG + FlagTree Triton/Triton-TLE
+> path instead and do not compile or link these files; see `docs/ppu-triton.md`.
+> The `FL_IVF_FLAT` nprobe anomaly reported below was fixed in the R5 follow-up
+> (`docs/ppu-r5-followup-20261118.md`); the current behavior is documented in the
+> top-level README.
+
 This directory contains the PPU enablement artifacts for knowhere-FL:
 a `libppu_runtime.so` shim implementing the 13 `hg*` launch-wrapper APIs
 referenced by `fl_ppu_adapter.cc`, plus a self-developed fused CUDA-C

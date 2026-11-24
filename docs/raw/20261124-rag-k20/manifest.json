@@ -1,0 +1,22 @@
+{
+  "kind": "offline_native_runtime_not_Milvus",
+  "device": 1,
+  "nb": 118600,
+  "eligible": 118592,
+  "nq": 20,
+  "ks": [
+    20
+  ],
+  "repeats": 3,
+  "profile": true,
+  "clocks": "free",
+  "steady_state_verified": false,
+  "warmup": "3 calls per k",
+  "bridge_sha256": "b6c70a135ba756844456b55d75d5759d5800ca93dbcd0f5be7906bd9210b96e3",
+  "query_sha256": "8cecdbe5b790325bc6055842f51ab6ae5335f908810b0c692c5db0e503393cc9",
+  "vector_sha256": "a24a6297b451d8787178a76834532ec42349e3800188d3b70959dbac12552287",
+  "bundle_manifests": {
+    "20": "9c30de7fe5f11683a95157a57ae705a03e2ac4adcd2f667d32aa28d75814122c"
+  },
+  "scope": "resident vector store, per-query H2D and native Search; route/filter construction/RPC excluded"
+}

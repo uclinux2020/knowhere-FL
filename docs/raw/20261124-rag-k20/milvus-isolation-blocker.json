@@ -1,0 +1,11 @@
+{
+  "state": "BLOCKED_BEFORE_SERVICE_START",
+  "measured": false,
+  "preflight_command": "unshare --net true",
+  "observed_stderr": "unshare: unshare failed: Operation not permitted",
+  "reason": "The prepared native Milvus recipe requires a private network namespace because the metrics listener is wildcard-only in the existing binary. No fallback to host networking or shared dependencies was attempted.",
+  "service_started": false,
+  "collections_modified": false,
+  "knowhere_source_modified": false,
+  "known_bundle_coverage": "The inspected historical candidate bundle covers k1/k20, not k50/k100. No assertion about uninspected directories."
+}

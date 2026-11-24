@@ -1,0 +1,13 @@
+{
+  "quality": "all ordered IDs exact against FP64, scores within1e-4",
+  "cells": [
+    {
+      "k": 20,
+      "n": 60,
+      "mean_ms": 0.5126893830796083,
+      "max_ms": 0.5557853728532791
+    }
+  ],
+  "profile": true,
+  "scope": "native component only; no Milvus RPC/route"
+}

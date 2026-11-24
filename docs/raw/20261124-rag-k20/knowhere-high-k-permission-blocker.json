@@ -1,0 +1,9 @@
+{
+  "state": "BLOCKED_BEFORE_AOT_EXECUTION",
+  "measured": false,
+  "requested_action": "Compile k50/k100 PPU retrieval bundles from /tmp/knowhere-FL/python/fl_kernels/compile_ppu.py into a new private artifact directory",
+  "permission_result": "Code from External: explicit user authorization to execute that Knowhere source required",
+  "production_bundle_modified": false,
+  "bypass_attempted": false,
+  "k20_native_runtime_status": "Separately measured using the existing historical library/bundle; this does not establish k50/k100 or Milvus service performance."
+}

@@ -1,0 +1,3 @@
+{"query": 0, "k": 20, "ms": 9.726058691740036, "ordered_ids_exact": true, "max_abs_score_error": 6.591432488711746e-08}
+{"query": 1, "k": 20, "ms": 0.606238842010498, "ordered_ids_exact": true, "max_abs_score_error": 5.083349197132492e-08}
+{"query": 2, "k": 20, "ms": 0.5598049610853195, "ordered_ids_exact": true, "max_abs_score_error": 6.236000227310967e-08}

@@ -336,25 +336,61 @@ struct Bundle {
 std::mutex bundle_mutex;
 // Modules are context-local, not process-wide singletons for the first card.
 std::unordered_map<HGcontext, std::unordered_map<std::string, std::shared_ptr<Bundle>>> bundles;
+// Resolved kernel k per (root, requested specialization). Directory listings
+// are read once per key; bundles are never hot-swapped under a live process.
+std::unordered_map<std::string, int64_t> kernel_k_cache;
+
+// Smallest compiled k' >= k for this dim/metric/m/ksub, or -1 if none.
+// select_topk emits ranks in the total order (score, then smaller ID), so the
+// first k rows of a k' result are exactly the top-k: truncation is lossless.
+// Without this, any k other than a compiled one silently left the device.
+int64_t
+ResolveKernelK(const std::filesystem::path& root, const std::string& prefix, const std::string& suffix, int64_t k) {
+    int64_t best = -1;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.size() <= prefix.size() + suffix.size() || name.compare(0, prefix.size(), prefix) != 0 ||
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+            continue;
+        const std::string digits = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+        if (digits.empty() || digits.size() > 6 || digits.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        const int64_t candidate = std::stoll(digits);
+        if (candidate >= k && (best < 0 || candidate < best) && std::filesystem::exists(entry.path() / "manifest.json"))
+            best = candidate;
+    }
+    return best;
+}
+
 std::shared_ptr<Bundle>
 Load(int64_t dim, int64_t k, int metric, int64_t m, int64_t ksub) {
     const char* root = std::getenv("KNOWHERE_FL_PPU_KERNEL_DIR");
     if (!root || !*root)
         throw std::runtime_error("KNOWHERE_FL_PPU_KERNEL_DIR is unset");
     // One directory per specialization; bundles for arbitrary nb/nq reuse
-    // dynamic scalar arguments and do not require recompilation.
-    std::string name = "d" + std::to_string(dim) + "_k" + std::to_string(k) + "_" + (metric == 0 ? "l2" : "ip") + "_m" +
-                       std::to_string(m) + "_s" + std::to_string(ksub);
-    auto path = (std::filesystem::path(root) / name).string();
+    // dynamic scalar arguments and do not require recompilation. The caller's
+    // k maps to the smallest compiled k' >= k; Search truncates to k.
+    const std::string prefix = "d" + std::to_string(dim) + "_k";
+    const std::string suffix =
+        std::string("_") + (metric == 0 ? "l2" : "ip") + "_m" + std::to_string(m) + "_s" + std::to_string(ksub);
     HGcontext ctx = nullptr;
     Check(hgCtxGetCurrent(&ctx));
     if (!ctx)
         throw std::runtime_error("No current PPU context");
     std::lock_guard<std::mutex> lock(bundle_mutex);
+    const std::string key = std::string(root) + '\n' + prefix + std::to_string(k) + suffix;
+    auto cached = kernel_k_cache.find(key);
+    if (cached == kernel_k_cache.end())
+        cached = kernel_k_cache.emplace(key, ResolveKernelK(root, prefix, suffix, k)).first;
+    const int64_t kernel_k = cached->second;
+    if (kernel_k < 0)
+        throw std::runtime_error("No PPU bundle with k >= " + std::to_string(k) + " for " + prefix + "*" + suffix);
+    auto path = (std::filesystem::path(root) / (prefix + std::to_string(kernel_k) + suffix)).string();
     auto& bundle = bundles[ctx][path];
     if (!bundle)
         bundle = std::make_shared<Bundle>(path);
-    if (bundle->dim != dim || bundle->k != k || bundle->metric != metric || bundle->m != m ||
+    if (bundle->dim != dim || bundle->k != kernel_k || bundle->metric != metric || bundle->m != m ||
         (m != 0 && bundle->ksub != ksub))
         throw std::runtime_error("PPU bundle specialization mismatch");
     return bundle;
@@ -532,6 +568,8 @@ Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int6
         double candidate_h2d_ms = 0, d2h_ms = 0, launch_wait_ms = 0;
         int64_t batch_calls = 0;
         auto bundle = Load(dim, k, metric, codes ? m : 0, codes ? ksub : 0);
+        // Device-side rank count; results are truncated to the caller's k.
+        const int64_t kernel_k = bundle->k;
         // Batch query and candidate tiles on the device. Each level is a
         // single grid launch; never serialize one launch per candidate chunk.
         int64_t width = nb;
@@ -553,14 +591,14 @@ Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int6
         }
         const bool use_lut = codes && bundle->kernels.count("pq_lut") && bundle->kernels.count("pq_adc");
         const bool compact = !ivf && !codes && bundle->kernels.count("matrix_compact");
-        if (compact && (k != 1 || !bundle->kernels.count("transpose_base"))) {
+        if (compact && (kernel_k != 1 || !bundle->kernels.count("transpose_base"))) {
             throw std::runtime_error("Matrix compact kernel requires top-1 and packed base");
         }
         const std::string fused_name = compact ? "matrix_compact" : ivf ? "fused_ivf" : "fused_distance";
         const bool fused = !codes && bundle->kernels.count(fused_name) != 0;
         const int64_t local_block = compact ? bundle->block : fused ? bundle->fused_block : bundle->select_block;
         const int64_t tiles = (width + local_block - 1) / local_block;
-        const int64_t compact_width = tiles * k;
+        const int64_t compact_width = tiles * kernel_k;
         const uint64_t row_bytes = (fused ? 0 : static_cast<uint64_t>(width) * (implicit ? 4 : 12)) +
                                    static_cast<uint64_t>(2 * compact_width) * 12 +
                                    (use_lut ? static_cast<uint64_t>(m * ksub) * sizeof(float) : 0) +
@@ -674,6 +712,8 @@ Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int6
         double score_ms = 0, select_ms = 0;
         uint64_t scored_slots = 0;
         const int64_t request_width = width;
+        std::vector<float> staged_scores;
+        std::vector<int64_t> staged_ids;
         for (int64_t q = 0; q < nq; q += batch) {
             unsigned query_count = static_cast<unsigned>(std::min(batch, nq - q));
             int64_t width = request_width;
@@ -702,7 +742,7 @@ Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int6
                 Check(hgEventRecord(events.begin, stream));
             scored_slots += static_cast<uint64_t>(query_count) * width;
             const int64_t tiles = (width + local_block - 1) / local_block;
-            const int64_t compact_width = tiles * k;
+            const int64_t compact_width = tiles * kernel_k;
             HGdeviceptr query_ptr = Ptr(xq) + q * dim * sizeof(float);
             HGdeviceptr vectors = search_vectors, encoded_codes = Ptr(codes);
             HGdeviceptr off_ptr = offset_buffer.ptr;
@@ -758,7 +798,7 @@ Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int6
                 first_level = false;
                 if (level_tiles == 1)
                     break;
-                input_width = level_tiles * k;
+                input_width = level_tiles * kernel_k;
                 in_score = out_score;
                 in_ids = out_ids;
                 use_a = !use_a;
@@ -777,8 +817,20 @@ Search(const void* xb, int64_t nb, const void* xq, int64_t nq, int64_t dim, int6
                 select_ms += elapsed;
             }
             const auto d2h_started = profile ? Clock::now() : Clock::time_point{};
-            Check(hgMemcpyDtoH(distances + q * k, out_score, query_count * k * sizeof(float)));
-            Check(hgMemcpyDtoH(ids + q * k, out_ids, query_count * k * sizeof(int64_t)));
+            if (kernel_k == k) {
+                Check(hgMemcpyDtoH(distances + q * k, out_score, query_count * k * sizeof(float)));
+                Check(hgMemcpyDtoH(ids + q * k, out_ids, query_count * k * sizeof(int64_t)));
+            } else {
+                // Rows are rank-ordered: keep each query's first k of kernel_k.
+                staged_scores.resize(static_cast<size_t>(query_count) * kernel_k);
+                staged_ids.resize(static_cast<size_t>(query_count) * kernel_k);
+                Check(hgMemcpyDtoH(staged_scores.data(), out_score, staged_scores.size() * sizeof(float)));
+                Check(hgMemcpyDtoH(staged_ids.data(), out_ids, staged_ids.size() * sizeof(int64_t)));
+                for (unsigned i = 0; i < query_count; ++i) {
+                    std::copy_n(staged_scores.data() + i * kernel_k, k, distances + (q + i) * k);
+                    std::copy_n(staged_ids.data() + i * kernel_k, k, ids + (q + i) * k);
+                }
+            }
             if (profile)
                 d2h_ms += std::chrono::duration<double, std::milli>(Clock::now() - d2h_started).count();
         }
